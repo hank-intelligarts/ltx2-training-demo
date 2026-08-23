@@ -21,6 +21,12 @@ class GemmaFeaturesExtractorProjLinear(torch.nn.Module, ModelConfigurator["Gemma
         super().__init__()
         self.aggregate_embed = torch.nn.Linear(3840 * 49, 3840, bias=False)
 
+    def load_state_dict(self, state_dict, strict=True, assign=False):
+        # v2.3 checkpoints store audio/video split keys; remap to unified key
+        if "video_aggregate_embed.weight" in state_dict and "aggregate_embed.weight" not in state_dict:
+            state_dict = {"aggregate_embed.weight": state_dict["video_aggregate_embed.weight"]}
+        return super().load_state_dict(state_dict, strict=strict, assign=assign)
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
         Forward pass for the feature extractor.
