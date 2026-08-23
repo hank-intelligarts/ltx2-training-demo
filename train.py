@@ -22,7 +22,7 @@ def ensure_installed():
     print("Installing ltx-core and ltx-trainer...")
     for pkg in ["ltx-core", "ltx-trainer"]:
         subprocess.check_call(
-            [sys.executable, "-m", "pip", "install", "-e", str(PACKAGES / pkg)],
+            [sys.executable, "-m", "pip", "install", str(PACKAGES / pkg)],
             stdout=subprocess.DEVNULL,
         )
 
