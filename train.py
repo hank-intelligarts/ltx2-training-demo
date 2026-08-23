@@ -6,31 +6,25 @@ import subprocess
 import sys
 from pathlib import Path
 
-LTX_REPO_URL = "https://github.com/Lightricks/LTX-Video.git"
-LTX_REPO_PATH = Path("/storage/SSD2/repos/LTX-2")
-LTX_TRAINER_PATH = LTX_REPO_PATH / "packages" / "ltx-trainer"
+ROOT = Path(__file__).resolve().parent
+PACKAGES = ROOT / "packages"
+TRAIN_SCRIPT = PACKAGES / "ltx-trainer" / "scripts" / "train.py"
 
 
-def ensure_ltx_trainer():
-    """確保 LTX-2 trainer code 存在，不存在就自動 clone 到 local SSD"""
-    train_script = LTX_TRAINER_PATH / "scripts" / "train.py"
-    if train_script.exists():
-        return train_script
+def ensure_installed():
+    """確保 ltx-core 和 ltx-trainer 已安裝到當前 venv"""
+    try:
+        import ltx_trainer  # noqa: F401
+        return
+    except ImportError:
+        pass
 
-    print(f"LTX-2 trainer not found, cloning to {LTX_REPO_PATH}...")
-    LTX_REPO_PATH.parent.mkdir(parents=True, exist_ok=True)
-    ret = subprocess.call(["git", "clone", "--depth", "1", LTX_REPO_URL, str(LTX_REPO_PATH)])
-    if ret != 0:
-        print("Failed to clone LTX-2 repo")
-        sys.exit(1)
-
-    # Install ltx-trainer + ltx-core into current venv
-    print("Installing ltx-trainer and ltx-core...")
+    print("Installing ltx-core and ltx-trainer...")
     for pkg in ["ltx-core", "ltx-trainer"]:
-        pkg_path = LTX_REPO_PATH / "packages" / pkg
-        subprocess.call([sys.executable, "-m", "pip", "install", "-e", str(pkg_path)])
-
-    return train_script
+        subprocess.check_call(
+            [sys.executable, "-m", "pip", "install", "-e", str(PACKAGES / pkg)],
+            stdout=subprocess.DEVNULL,
+        )
 
 
 def main():
@@ -43,10 +37,10 @@ def main():
         print(f"Config not found: {config_path}")
         sys.exit(1)
 
-    train_script = ensure_ltx_trainer()
+    ensure_installed()
     print(f"Config:  {config_path}")
-    print(f"Trainer: {train_script}")
-    sys.exit(subprocess.call([sys.executable, str(train_script), str(config_path)]))
+    print(f"Trainer: {TRAIN_SCRIPT}")
+    sys.exit(subprocess.call([sys.executable, str(TRAIN_SCRIPT), str(config_path)]))
 
 
 if __name__ == "__main__":
