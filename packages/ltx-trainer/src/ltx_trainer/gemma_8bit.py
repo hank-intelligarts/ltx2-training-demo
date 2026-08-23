@@ -95,12 +95,12 @@ def load_8bit_gemma(
 
     # Create and load video embeddings connector
     embeddings_connector = Embeddings1DConnectorConfigurator.from_config(config)
-    embeddings_connector.load_state_dict(extract_state_dict("embeddings_connector."))
+    embeddings_connector.load_state_dict(extract_state_dict("embeddings_connector."), strict=False)
     embeddings_connector = embeddings_connector.to(device=gemma_model.device, dtype=dtype)
 
     # Create and load audio embeddings connector
     audio_embeddings_connector = Embeddings1DConnectorConfigurator.from_config(config)
-    audio_embeddings_connector.load_state_dict(extract_state_dict("audio_embeddings_connector."))
+    audio_embeddings_connector.load_state_dict(extract_state_dict("audio_embeddings_connector."), strict=False)
     audio_embeddings_connector = audio_embeddings_connector.to(device=gemma_model.device, dtype=dtype)
 
     # Construct the text encoder
