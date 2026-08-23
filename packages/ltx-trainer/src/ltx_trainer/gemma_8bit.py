@@ -98,8 +98,16 @@ def load_8bit_gemma(
     embeddings_connector.load_state_dict(extract_state_dict("embeddings_connector."), strict=False)
     embeddings_connector = embeddings_connector.to(device=gemma_model.device, dtype=dtype)
 
-    # Create and load audio embeddings connector
-    audio_embeddings_connector = Embeddings1DConnectorConfigurator.from_config(config)
+    # Create and load audio embeddings connector (uses audio_connector_* config keys)
+    audio_config = dict(config)
+    t = audio_config.get("transformer", {})
+    audio_t = dict(t)
+    # Remap audio_connector_* keys to connector_* so from_config reads them
+    for k in list(audio_t.keys()):
+        if k.startswith("audio_connector_"):
+            audio_t[k.replace("audio_connector_", "connector_")] = audio_t[k]
+    audio_config["transformer"] = audio_t
+    audio_embeddings_connector = Embeddings1DConnectorConfigurator.from_config(audio_config)
     audio_embeddings_connector.load_state_dict(extract_state_dict("audio_embeddings_connector."), strict=False)
     audio_embeddings_connector = audio_embeddings_connector.to(device=gemma_model.device, dtype=dtype)
 
