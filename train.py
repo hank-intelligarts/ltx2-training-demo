@@ -7,12 +7,12 @@ import sys
 from pathlib import Path
 
 LTX_REPO_URL = "https://github.com/Lightricks/LTX-Video.git"
-LTX_REPO_PATH = Path("/storage/Internal_NAS/repos/LTX-2")
+LTX_REPO_PATH = Path("/storage/SSD2/repos/LTX-2")
 LTX_TRAINER_PATH = LTX_REPO_PATH / "packages" / "ltx-trainer"
 
 
 def ensure_ltx_trainer():
-    """確保 LTX-2 trainer code 存在，不存在就自動 clone"""
+    """確保 LTX-2 trainer code 存在，不存在就自動 clone 到 local SSD"""
     train_script = LTX_TRAINER_PATH / "scripts" / "train.py"
     if train_script.exists():
         return train_script
@@ -24,9 +24,11 @@ def ensure_ltx_trainer():
         print("Failed to clone LTX-2 repo")
         sys.exit(1)
 
-    # Install ltx-trainer into current venv
-    print("Installing ltx-trainer...")
-    subprocess.call([sys.executable, "-m", "pip", "install", "-e", str(LTX_TRAINER_PATH)])
+    # Install ltx-trainer + ltx-core into current venv
+    print("Installing ltx-trainer and ltx-core...")
+    for pkg in ["ltx-core", "ltx-trainer"]:
+        pkg_path = LTX_REPO_PATH / "packages" / pkg
+        subprocess.call([sys.executable, "-m", "pip", "install", "-e", str(pkg_path)])
 
     return train_script
 
