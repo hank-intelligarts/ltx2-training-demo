@@ -203,6 +203,10 @@ class Embeddings1DConnectorConfigurator(ModelConfigurator[Embeddings1DConnector]
         pe_max_pos = config.get("connector_positional_embedding_max_pos", [1])
 
         connector = Embeddings1DConnector(
+            attention_head_dim=config.get("connector_attention_head_dim", 128),
+            num_attention_heads=config.get("connector_num_attention_heads", 30),
+            num_layers=config.get("connector_num_layers", 2),
+            num_learnable_registers=config.get("connector_num_learnable_registers", 128),
             positional_embedding_max_pos=pe_max_pos,
             rope_type=rope_type,
             double_precision_rope=double_precision_rope,

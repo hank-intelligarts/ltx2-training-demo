@@ -1,6 +1,9 @@
 """
 LTX-2 LoRA Training Launcher
 使用方式：python train.py configs/ltx2_lora_ryan.yaml
+
+先安裝 repo 內的 ltx-core / ltx-trainer，再用子程序跑 training script，
+確保 import 的一定是本 repo 的版本。
 """
 import subprocess
 import sys
@@ -11,8 +14,8 @@ PACKAGES = ROOT / "packages"
 TRAIN_SCRIPT = PACKAGES / "ltx-trainer" / "scripts" / "train.py"
 
 
-def ensure_installed():
-    """確保 ltx-core 和 ltx-trainer 已安裝到當前 venv（從本 repo 的 packages/）"""
+def install_packages():
+    """從本 repo 的 packages/ 安裝 ltx-core 和 ltx-trainer 到當前 venv"""
     print("Installing ltx-core and ltx-trainer from repo...")
     for pkg in ["ltx-core", "ltx-trainer"]:
         subprocess.check_call(
@@ -20,6 +23,7 @@ def ensure_installed():
              "--no-deps", str(PACKAGES / pkg)],
             stdout=subprocess.DEVNULL,
         )
+    print("Done.")
 
 
 def main():
@@ -32,7 +36,8 @@ def main():
         print(f"Config not found: {config_path}")
         sys.exit(1)
 
-    ensure_installed()
+    # 先安裝，再用全新的子程序跑 training（避免舊 import cache）
+    install_packages()
     print(f"Config:  {config_path}")
     print(f"Trainer: {TRAIN_SCRIPT}")
     sys.exit(subprocess.call([sys.executable, str(TRAIN_SCRIPT), str(config_path)]))
