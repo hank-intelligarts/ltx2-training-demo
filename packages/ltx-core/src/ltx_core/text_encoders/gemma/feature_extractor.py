@@ -25,6 +25,10 @@ class GemmaFeaturesExtractorProjLinear(torch.nn.Module, ModelConfigurator["Gemma
         # v2.3 checkpoints store audio/video split keys; remap to unified key
         if "video_aggregate_embed.weight" in state_dict and "aggregate_embed.weight" not in state_dict:
             state_dict = {"aggregate_embed.weight": state_dict["video_aggregate_embed.weight"]}
+        # Resize linear layer to match checkpoint shape if needed
+        w = state_dict.get("aggregate_embed.weight")
+        if w is not None and w.shape[0] != self.aggregate_embed.out_features:
+            self.aggregate_embed = torch.nn.Linear(w.shape[1], w.shape[0], bias=False)
         return super().load_state_dict(state_dict, strict=strict, assign=assign)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:

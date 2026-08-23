@@ -12,17 +12,12 @@ TRAIN_SCRIPT = PACKAGES / "ltx-trainer" / "scripts" / "train.py"
 
 
 def ensure_installed():
-    """確保 ltx-core 和 ltx-trainer 已安裝到當前 venv"""
-    try:
-        import ltx_trainer  # noqa: F401
-        return
-    except ImportError:
-        pass
-
-    print("Installing ltx-core and ltx-trainer...")
+    """確保 ltx-core 和 ltx-trainer 已安裝到當前 venv（從本 repo 的 packages/）"""
+    print("Installing ltx-core and ltx-trainer from repo...")
     for pkg in ["ltx-core", "ltx-trainer"]:
         subprocess.check_call(
-            [sys.executable, "-m", "pip", "install", str(PACKAGES / pkg)],
+            [sys.executable, "-m", "pip", "install", "--force-reinstall",
+             "--no-deps", str(PACKAGES / pkg)],
             stdout=subprocess.DEVNULL,
         )
 
