@@ -31,7 +31,7 @@ class AVGemmaTextEncoderModel(GemmaTextEncoderModelBase):
         self,
         feature_extractor_linear: GemmaFeaturesExtractorProjLinear,
         embeddings_connector: Embeddings1DConnector,
-        audio_embeddings_connector: Embeddings1DConnector,
+        audio_embeddings_connector: Embeddings1DConnector | None = None,
         tokenizer: LTXVGemmaTokenizer | None = None,
         model: Gemma3ForConditionalGeneration | None = None,
         dtype: torch.dtype = torch.bfloat16,
@@ -43,7 +43,7 @@ class AVGemmaTextEncoderModel(GemmaTextEncoderModelBase):
             dtype=dtype,
         )
         self.embeddings_connector = embeddings_connector.to(dtype=dtype)
-        self.audio_embeddings_connector = audio_embeddings_connector.to(dtype=dtype)
+        self.audio_embeddings_connector = audio_embeddings_connector.to(dtype=dtype) if audio_embeddings_connector is not None else None
 
     def _run_connectors(
         self, encoded_input: torch.Tensor, attention_mask: torch.Tensor
@@ -60,7 +60,10 @@ class AVGemmaTextEncoderModel(GemmaTextEncoderModelBase):
         attention_mask = attention_mask.reshape([encoded.shape[0], encoded.shape[1], 1])
         encoded = encoded * attention_mask
 
-        encoded_for_audio, _ = self.audio_embeddings_connector(encoded_input, connector_attention_mask)
+        if self.audio_embeddings_connector is not None:
+            encoded_for_audio, _ = self.audio_embeddings_connector(encoded_input, connector_attention_mask)
+        else:
+            encoded_for_audio = torch.zeros_like(encoded)
 
         return encoded, encoded_for_audio, attention_mask.squeeze(-1)
 

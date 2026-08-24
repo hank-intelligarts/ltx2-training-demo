@@ -39,6 +39,7 @@ def load_8bit_gemma(
     checkpoint_path: str | Path,
     gemma_model_path: str | Path,
     dtype: torch.dtype = torch.bfloat16,
+    with_audio: bool = True,
 ) -> "AVGemmaTextEncoderModel":
     """Load the Gemma text encoder in 8-bit precision using bitsandbytes.
     This function bypasses ltx-core's standard loading path to enable 8-bit quantization
@@ -49,6 +50,7 @@ def load_8bit_gemma(
         checkpoint_path: Path to the LTX-2 safetensors checkpoint file
         gemma_model_path: Path to Gemma model directory
         dtype: Data type for non-quantized model weights (feature extractor, connectors)
+        with_audio: Whether to load the audio embeddings connector
     Returns:
         Loaded AVGemmaTextEncoderModel with 8-bit quantized Gemma backbone
     Raises:
@@ -99,17 +101,19 @@ def load_8bit_gemma(
     embeddings_connector = embeddings_connector.to(device=gemma_model.device, dtype=dtype)
 
     # Create and load audio embeddings connector (uses audio_connector_* config keys)
-    audio_config = dict(config)
-    t = audio_config.get("transformer", {})
-    audio_t = dict(t)
-    # Remap audio_connector_* keys to connector_* so from_config reads them
-    for k in list(audio_t.keys()):
-        if k.startswith("audio_connector_"):
-            audio_t[k.replace("audio_connector_", "connector_")] = audio_t[k]
-    audio_config["transformer"] = audio_t
-    audio_embeddings_connector = Embeddings1DConnectorConfigurator.from_config(audio_config)
-    audio_embeddings_connector.load_state_dict(extract_state_dict("audio_embeddings_connector."), strict=False)
-    audio_embeddings_connector = audio_embeddings_connector.to(device=gemma_model.device, dtype=dtype)
+    audio_embeddings_connector = None
+    if with_audio:
+        audio_config = dict(config)
+        t = audio_config.get("transformer", {})
+        audio_t = dict(t)
+        # Remap audio_connector_* keys to connector_* so from_config reads them
+        for k in list(audio_t.keys()):
+            if k.startswith("audio_connector_"):
+                audio_t[k.replace("audio_connector_", "connector_")] = audio_t[k]
+        audio_config["transformer"] = audio_t
+        audio_embeddings_connector = Embeddings1DConnectorConfigurator.from_config(audio_config)
+        audio_embeddings_connector.load_state_dict(extract_state_dict("audio_embeddings_connector."), strict=False)
+        audio_embeddings_connector = audio_embeddings_connector.to(device=gemma_model.device, dtype=dtype)
 
     # Construct the text encoder
     text_encoder = AVGemmaTextEncoderModel(

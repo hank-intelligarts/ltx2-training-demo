@@ -351,6 +351,7 @@ class LtxvTrainer:
             device="cuda",
             dtype=torch.bfloat16,
             load_in_8bit=self._config.acceleration.load_text_encoder_in_8bit,
+            with_audio=self._training_strategy.requires_audio,
         )
 
         # Cache validation embeddings if prompts are configured

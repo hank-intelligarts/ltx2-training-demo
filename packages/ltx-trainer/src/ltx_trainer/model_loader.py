@@ -192,6 +192,7 @@ def load_text_encoder(
     device: Device = "cpu",
     dtype: torch.dtype = torch.bfloat16,
     load_in_8bit: bool = False,
+    with_audio: bool = True,
 ) -> "AVGemmaTextEncoderModel":
     """Load the Gemma text encoder.
     Args:
@@ -202,6 +203,7 @@ def load_text_encoder(
         load_in_8bit: Whether to load the Gemma model in 8-bit precision using bitsandbytes.
             When True, the model is loaded with device_map="auto" and the device argument
             is ignored for the Gemma backbone (feature extractor still uses dtype).
+        with_audio: Whether to load the audio embeddings connector
     Returns:
         Loaded AVGemmaTextEncoderModel
     """
@@ -212,7 +214,7 @@ def load_text_encoder(
     if load_in_8bit:
         from ltx_trainer.gemma_8bit import load_8bit_gemma
 
-        return load_8bit_gemma(checkpoint_path, gemma_model_path, dtype)
+        return load_8bit_gemma(checkpoint_path, gemma_model_path, dtype, with_audio=with_audio)
 
     # Standard loading path
     from ltx_core.loader.single_gpu_model_builder import SingleGPUModelBuilder
