@@ -66,8 +66,9 @@ def main():
         "--text-encoder-path", text_encoder_path,
         "--output-dir", preprocessed_root,
     ]
-    if load_8bit:
-        cmd.append("--load-text-encoder-in-8bit")
+    # Skip 8-bit for preprocessing — bf16 is more reliable and
+    # A6000/5090 have enough VRAM for Gemma4-12B in bf16 (~24GB).
+    # 8-bit is only used during training (handled by trainer.py).
     if with_audio:
         cmd.append("--with-audio")
 
