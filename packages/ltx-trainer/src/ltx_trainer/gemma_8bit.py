@@ -68,16 +68,13 @@ def load_8bit_gemma(
     gemma_path = _find_gemma_subpath(gemma_model_path, "model*.safetensors")
     tokenizer_path = _find_gemma_subpath(gemma_model_path, "tokenizer.model")
 
-    quantization_config = BitsAndBytesConfig(
-        load_in_8bit=True,
-        llm_int8_enable_fp32_cpu_offload=True,
-    )
+    quantization_config = BitsAndBytesConfig(load_in_8bit=True)
     with _suppress_accelerate_memory_warnings():
         gemma_model = AutoModelForImageTextToText.from_pretrained(
             gemma_path,
             quantization_config=quantization_config,
             torch_dtype=torch.bfloat16,
-            device_map="auto",
+            device_map={"": 0},
             local_files_only=True,
         )
 
