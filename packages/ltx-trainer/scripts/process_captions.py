@@ -272,6 +272,7 @@ def compute_captions_embeddings(  # noqa: PLR0913
             device=device,
             dtype=torch.bfloat16,
             load_in_8bit=load_in_8bit,
+            with_audio=False,
         )
 
     logger.info("Text encoder loaded successfully")

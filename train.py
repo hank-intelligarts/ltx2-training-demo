@@ -23,6 +23,11 @@ def install_packages():
              "--no-deps", str(PACKAGES / pkg)],
             stdout=subprocess.DEVNULL,
         )
+    # Ensure compatible bitsandbytes version
+    subprocess.check_call(
+        [sys.executable, "-m", "pip", "install", "--upgrade", "bitsandbytes>=0.45.0"],
+        stdout=subprocess.DEVNULL,
+    )
     print("Done.")
 
 
