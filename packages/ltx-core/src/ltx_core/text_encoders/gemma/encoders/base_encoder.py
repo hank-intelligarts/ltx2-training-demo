@@ -3,7 +3,7 @@ from pathlib import Path
 
 import torch
 from einops import rearrange
-from transformers import AutoImageProcessor, Gemma3ForConditionalGeneration, Gemma3Processor
+from transformers import AutoImageProcessor, AutoModelForImageTextToText, AutoProcessor
 
 from ltx_core.loader.module_ops import ModuleOps
 from ltx_core.text_encoders.gemma.feature_extractor import GemmaFeaturesExtractorProjLinear
@@ -18,7 +18,7 @@ class GemmaTextEncoderModelBase(torch.nn.Module):
     obtains hidden states from the base language model, applies a linear feature extractor.
     Args:
         tokenizer (LTXVGemmaTokenizer): The tokenizer used for text preprocessing.
-        model (Gemma3ForConditionalGeneration): The base Gemma LLM.
+        model (AutoModelForImageTextToText): The base Gemma LLM.
         feature_extractor_linear (GemmaFeaturesExtractorProjLinear): Linear projection for hidden state aggregation.
         dtype (torch.dtype, optional): The data type for model parameters (default: torch.bfloat16).
     """
@@ -27,8 +27,8 @@ class GemmaTextEncoderModelBase(torch.nn.Module):
         self,
         feature_extractor_linear: GemmaFeaturesExtractorProjLinear,
         tokenizer: LTXVGemmaTokenizer | None = None,
-        model: Gemma3ForConditionalGeneration | None = None,
-        img_processor: Gemma3Processor | None = None,
+        model: AutoModelForImageTextToText | None = None,
+        img_processor: AutoProcessor | None = None,
         dtype: torch.dtype = torch.bfloat16,
     ) -> None:
         super().__init__()
@@ -236,7 +236,7 @@ def module_ops_from_gemma_root(gemma_root: str) -> tuple[ModuleOps, ...]:
     processor_path = _find_matching_dir(gemma_root, "preprocessor_config.json")
 
     def load_gemma(module: GemmaTextEncoderModelBase) -> GemmaTextEncoderModelBase:
-        module.model = Gemma3ForConditionalGeneration.from_pretrained(
+        module.model = AutoModelForImageTextToText.from_pretrained(
             gemma_path, local_files_only=True, torch_dtype=torch.bfloat16
         )
         return module
@@ -246,10 +246,7 @@ def module_ops_from_gemma_root(gemma_root: str) -> tuple[ModuleOps, ...]:
         return module
 
     def load_processor(module: GemmaTextEncoderModelBase) -> GemmaTextEncoderModelBase:
-        image_processor = AutoImageProcessor.from_pretrained(processor_path, local_files_only=True)
-        if not module.tokenizer:
-            raise ValueError("Tokenizer model operation must be performed before processor model operation")
-        module.processor = Gemma3Processor(image_processor=image_processor, tokenizer=module.tokenizer.tokenizer)
+        module.processor = AutoProcessor.from_pretrained(processor_path, local_files_only=True)
         return module
 
     gemma_load_ops = ModuleOps(

@@ -1,7 +1,7 @@
 from typing import NamedTuple
 
 import torch
-from transformers import Gemma3ForConditionalGeneration
+from transformers import AutoModelForImageTextToText
 
 from ltx_core.loader.sd_ops import SDOps
 from ltx_core.model.model_protocol import ModelConfigurator
@@ -31,7 +31,7 @@ class VideoGemmaTextEncoderModel(GemmaTextEncoderModelBase):
         feature_extractor_linear: GemmaFeaturesExtractorProjLinear,
         embeddings_connector: Embeddings1DConnector,
         tokenizer: LTXVGemmaTokenizer | None = None,
-        model: Gemma3ForConditionalGeneration | None = None,
+        model: AutoModelForImageTextToText | None = None,
         dtype: torch.dtype = torch.bfloat16,
     ) -> None:
         super().__init__(
