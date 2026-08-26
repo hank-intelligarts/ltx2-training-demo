@@ -41,7 +41,7 @@ acceleration:
   load_text_encoder_in_8bit: true
 
 data:
-  preprocessed_data_root: "/storage/SSD2/hank/Disney-VideoGeneration-Dataset/.precomputed"
+  preprocessed_data_root: "/storage/Internal_NAS/hank/Disney-VideoGeneration-Dataset/.precomputed"
   num_dataloader_workers: 2
 
 validation:
@@ -84,4 +84,4 @@ wandb:
   log_validation_videos: true
 
 seed: 42
-output_dir: "/storage/SSD2/hank/ltx2_lora_disney_output"
+output_dir: "/storage/Internal_NAS/hank/ltx2_lora_disney_output"
