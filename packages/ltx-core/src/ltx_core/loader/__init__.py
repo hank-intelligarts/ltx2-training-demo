@@ -1,6 +1,13 @@
 """Loader utilities for model weights, LoRAs, and safetensor operations."""
 
 from ltx_core.loader.fuse_loras import apply_loras
+from ltx_core.loader.helpers import (
+    create_meta_model,
+    load_state_dict,
+    parse_model_version,
+    read_model_config,
+    read_model_metadata,
+)
 from ltx_core.loader.module_ops import ModuleOps
 from ltx_core.loader.primitives import (
     LoRAAdaptableProtocol,
@@ -10,7 +17,12 @@ from ltx_core.loader.primitives import (
     StateDict,
     StateDictLoader,
 )
-from ltx_core.loader.registry import DummyRegistry, Registry, StateDictRegistry
+from ltx_core.loader.registry import (
+    DummyRegistry,
+    ModelRegistry,
+    Registry,
+    module_registry_key,
+)
 from ltx_core.loader.sd_ops import (
     LTXV_LORA_COMFY_RENAMING_MAP,
     ContentMatching,
@@ -34,6 +46,7 @@ __all__ = [
     "LoraPathStrengthAndSDOps",
     "LoraStateDictWithStrength",
     "ModelBuilderProtocol",
+    "ModelRegistry",
     "ModuleOps",
     "Registry",
     "SDKeyValueOperation",
@@ -43,6 +56,11 @@ __all__ = [
     "SingleGPUModelBuilder",
     "StateDict",
     "StateDictLoader",
-    "StateDictRegistry",
     "apply_loras",
+    "create_meta_model",
+    "load_state_dict",
+    "module_registry_key",
+    "parse_model_version",
+    "read_model_config",
+    "read_model_metadata",
 ]

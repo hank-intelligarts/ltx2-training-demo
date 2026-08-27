@@ -56,8 +56,22 @@ class SafetensorsModelStateDictLoader(StateDictLoader):
         self.weight_loader = weight_loader if weight_loader is not None else SafetensorsStateDictLoader()
 
     def metadata(self, path: str) -> dict:
+        """Read the full safetensors ``__metadata__`` dict.
+        Values are JSON string-encoded by convention (e.g. ``config``, ``gemma_source_checkpoint``);
+        each is parsed if it's valid JSON and left as a raw string otherwise (e.g. ``license``,
+        ``model_version``).
+        """
         with safetensors.safe_open(path, framework="pt") as f:
-            return json.loads(f.metadata()["config"])
+            meta = f.metadata()
+            if meta is None:
+                return {}
+            parsed = {}
+            for key, value in meta.items():
+                try:
+                    parsed[key] = json.loads(value)
+                except json.JSONDecodeError:
+                    parsed[key] = value
+            return parsed
 
     def load(self, path: str | list[str], sd_ops: SDOps | None = None, device: torch.device | None = None) -> StateDict:
         return self.weight_loader.load(path, sd_ops, device)

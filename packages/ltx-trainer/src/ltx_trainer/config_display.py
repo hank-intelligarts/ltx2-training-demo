@@ -85,6 +85,7 @@ def print_config(config: LtxTrainerConfig) -> None:
                     ("Mixed Precision", accel.mixed_precision_mode or "[dim]—[/]"),
                     ("Quantization", str(accel.quantization) if accel.quantization else "[dim]—[/]"),
                     ("Text Encoder 8bit", fmt(accel.load_text_encoder_in_8bit)),
+                    ("Optimizer CPU Offload", fmt(accel.offload_optimizer_during_validation)),
                 ],
             ),
             (
@@ -95,12 +96,17 @@ def print_config(config: LtxTrainerConfig) -> None:
                     ("Video Dims", f"{val.video_dims[0]}x{val.video_dims[1]}, {val.video_dims[2]} frames"),
                     ("Frame Rate", f"{val.frame_rate} fps"),
                     ("Inference Steps", str(val.inference_steps)),
-                    ("CFG Scale", str(val.guidance_scale)),
+                    ("CFG Scale", f"video={val.video_cfg_scale}; audio={val.audio_cfg_scale}"),
                     (
-                        "STG",
-                        f"scale={val.stg_scale}; blocks={fmt(val.stg_blocks)}; mode={val.stg_mode}"
-                        if val.stg_scale > 0
+                        "STG Scale",
+                        f"video={val.video_stg_scale}; audio={val.audio_stg_scale}; blocks={fmt(val.stg_blocks)}"
+                        if val.video_stg_scale > 0 or val.audio_stg_scale > 0
                         else "[dim]Disabled[/]",
+                    ),
+                    ("Guidance Rescale", str(val.guidance_rescale)),
+                    (
+                        "Modality Guidance",
+                        f"video={val.video_modality_guidance_scale}; audio={val.audio_modality_guidance_scale}",
                     ),
                     ("Seed", str(val.seed)),
                 ],

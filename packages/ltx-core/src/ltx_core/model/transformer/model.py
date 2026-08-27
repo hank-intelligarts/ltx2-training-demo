@@ -1,20 +1,30 @@
+import logging
 from enum import Enum
 
 import torch
 
-from ltx_core.guidance.perturbations import BatchedPerturbationConfig
-from ltx_core.model.transformer.adaln import AdaLayerNormSingle
-from ltx_core.model.transformer.attention import AttentionCallable, AttentionFunction
+from ltx_core.guidance.perturbations import BatchedPerturbationConfig, PerturbationType
+from ltx_core.model.disposable import Disposable
+from ltx_core.model.model_protocol import LTXModelProtocol
+from ltx_core.model.transformer.adaln import AdaLayerNormSingle, adaln_embedding_coefficient
+from ltx_core.model.transformer.attention import attention_label
 from ltx_core.model.transformer.modality import Modality
 from ltx_core.model.transformer.rope import LTXRopeType
-from ltx_core.model.transformer.text_projection import PixArtAlphaTextProjection
-from ltx_core.model.transformer.transformer import BasicAVTransformerBlock, TransformerConfig
+from ltx_core.model.transformer.transformer import (
+    DEFAULT_TRANSFORMER_OPS,
+    BasicAVTransformerBlock,
+    TransformerConfig,
+    TransformerOpsConfig,
+)
 from ltx_core.model.transformer.transformer_args import (
+    BlockPerturbationsProcessor,
     MultiModalTransformerArgsPreprocessor,
     TransformerArgs,
     TransformerArgsPreprocessor,
 )
 from ltx_core.utils import to_denoised
+
+logger = logging.getLogger(__name__)
 
 
 class LTXModelType(Enum):
@@ -29,7 +39,7 @@ class LTXModelType(Enum):
         return self in (LTXModelType.AudioVideo, LTXModelType.AudioOnly)
 
 
-class LTXModel(torch.nn.Module):
+class LTXModel(torch.nn.Module, Disposable):
     """
     LTX model transformer implementation.
     This class implements the transformer blocks for the LTX model.
@@ -46,8 +56,7 @@ class LTXModel(torch.nn.Module):
         num_layers: int = 48,
         cross_attention_dim: int = 4096,
         norm_eps: float = 1e-06,
-        attention_type: AttentionFunction | AttentionCallable = AttentionFunction.DEFAULT,
-        caption_channels: int = 3840,
+        ops: TransformerOpsConfig = DEFAULT_TRANSFORMER_OPS,
         positional_embedding_theta: float = 10000.0,
         positional_embedding_max_pos: list[int] | None = None,
         timestep_scale_multiplier: int = 1000,
@@ -59,17 +68,37 @@ class LTXModel(torch.nn.Module):
         audio_cross_attention_dim: int = 2048,
         audio_positional_embedding_max_pos: list[int] | None = None,
         av_ca_timestep_scale_multiplier: int = 1,
-        rope_type: LTXRopeType = LTXRopeType.INTERLEAVED,
+        rope_type: LTXRopeType = LTXRopeType.SPLIT,
         double_precision_rope: bool = False,
+        apply_gated_attention: bool = False,
+        caption_projection: torch.nn.Module | None = None,
+        audio_caption_projection: torch.nn.Module | None = None,
+        cross_attention_adaln: bool = False,
+        use_prompt_adaln_single: bool = True,
+        ff_bias: bool = True,
+        audio_ff_bias: bool = True,
+        use_keyframes_abs_pos_embedding: bool = False,
     ):
         super().__init__()
+        # Log the attention backends this transformer is built with. Reading the resolved
+        # ``label`` off the ops reports whatever was selected -- AUTOMATIC, an explicit pin
+        # (PYTORCH/FA3/FA4/SDPA_*), or a directly supplied callable -- so this is the
+        # single source of truth for which kernel a build uses. Fires once per build.
+        logger.info(
+            "Building transformer with attention backends -- self: %s, masked: %s",
+            attention_label(ops.attention_ops.attention_function),
+            attention_label(ops.attention_ops.masked_attention_function),
+        )
         self._enable_gradient_checkpointing = False
+        self.cross_attention_adaln = cross_attention_adaln
+        self.use_prompt_adaln_single = use_prompt_adaln_single
         self.use_middle_indices_grid = use_middle_indices_grid
         self.rope_type = rope_type
         self.double_precision_rope = double_precision_rope
         self.timestep_scale_multiplier = timestep_scale_multiplier
         self.positional_embedding_theta = positional_embedding_theta
         self.model_type = model_type
+        self.use_keyframes_abs_pos_embedding = use_keyframes_abs_pos_embedding
         cross_pe_max_pos = None
         if model_type.is_video_enabled():
             if positional_embedding_max_pos is None:
@@ -80,8 +109,8 @@ class LTXModel(torch.nn.Module):
             self._init_video(
                 in_channels=in_channels,
                 out_channels=out_channels,
-                caption_channels=caption_channels,
                 norm_eps=norm_eps,
+                caption_projection=caption_projection,
             )
 
         if model_type.is_audio_enabled():
@@ -93,8 +122,8 @@ class LTXModel(torch.nn.Module):
             self._init_audio(
                 in_channels=audio_in_channels,
                 out_channels=audio_out_channels,
-                caption_channels=caption_channels,
                 norm_eps=norm_eps,
+                caption_projection=audio_caption_projection,
             )
 
         if model_type.is_video_enabled() and model_type.is_audio_enabled():
@@ -112,26 +141,89 @@ class LTXModel(torch.nn.Module):
             audio_attention_head_dim=audio_attention_head_dim if model_type.is_audio_enabled() else 0,
             audio_cross_attention_dim=audio_cross_attention_dim,
             norm_eps=norm_eps,
-            attention_type=attention_type,
+            ops=ops,
+            apply_gated_attention=apply_gated_attention,
+            ff_bias=ff_bias,
+            audio_ff_bias=audio_ff_bias,
         )
+        # Hook for per-block input prep. Compile transforms in `compiling.py`
+        # wrap (not replace) this with a processor that also marks the seq dim
+        # dynamic, so any caller customisation here is preserved as the inner.
+        self.block_input_processor = BlockPerturbationsProcessor()
+
+    @property
+    def _adaln_embedding_coefficient(self) -> int:
+        return adaln_embedding_coefficient(self.cross_attention_adaln)
+
+    def _keyframes_embedding(self) -> torch.Tensor | None:
+        """Look the parameter up on each call.
+        Deliberately not a captured reference: this parameter is absent from checkpoints that
+        predate it, so it is created on the meta device and only later materialized -- which
+        replaces the parameter object. A stale reference would keep pointing at the meta tensor.
+        """
+        return getattr(self, "keyframes_abs_pos_embedding", None)
+
+    @property
+    def supports_keyframes_abs_pos_embedding(self) -> bool:
+        """Whether this model has a usable keyframe absolute-position embedding.
+        False for models built without the flag, and also for a model whose config set the flag
+        but whose checkpoint carried no weight for it (the parameter would still be on ``meta``).
+        """
+        embedding = self._keyframes_embedding()
+        return embedding is not None and not embedding.is_meta
+
+    def enable_keyframes_abs_pos_embedding(self) -> None:
+        """Ensure the keyframe embedding exists and holds real zeros, creating it if needed.
+        Covers both ways a loaded model can arrive without a usable parameter:
+        - The checkpoint predates the feature entirely, so its config never set
+          ``use_keyframes_abs_pos_embedding`` and no parameter was built. It is created here.
+        - The config did set the flag but the checkpoint carried no weight for it. Models are
+          built on the meta device and loaded with ``strict=False, assign=True``, so such a
+          parameter stays on ``meta`` and would fail at the first forward.
+        Idempotent, and never overwrites a parameter that already holds real storage -- a
+        checkpoint carrying a trained embedding keeps it. The preprocessors resolve the parameter
+        through a provider on every call, so enabling it after the model is built is safe.
+        A zero embedding is an exact no-op, so this only makes the marker *harmless*, not
+        meaningful: it does not give an untrained checkpoint the keyframe capability.
+        """
+        if not self.model_type.is_video_enabled():
+            raise ValueError("The keyframe absolute-position embedding is a video-stream parameter")
+
+        existing = self._keyframes_embedding()
+        if existing is not None and not existing.is_meta:
+            return
+
+        reference = self.patchify_proj.weight
+        shape = existing.shape if existing is not None else (1, self.inner_dim)
+        dtype = existing.dtype if existing is not None else reference.dtype
+        self.use_keyframes_abs_pos_embedding = True
+        self.keyframes_abs_pos_embedding = torch.nn.Parameter(torch.zeros(shape, dtype=dtype, device=reference.device))
 
     def _init_video(
         self,
         in_channels: int,
         out_channels: int,
-        caption_channels: int,
         norm_eps: float,
+        caption_projection: torch.nn.Module | None = None,
     ) -> None:
         """Initialize video-specific components."""
         # Video input components
         self.patchify_proj = torch.nn.Linear(in_channels, self.inner_dim, bias=True)
+        if caption_projection is not None:
+            self.caption_projection = caption_projection
 
-        self.adaln_single = AdaLayerNormSingle(self.inner_dim)
+        # Marks tokens whose latent encodes a single standalone pixel frame. Zero-initialized, so a
+        # checkpoint that predates it behaves identically until the parameter is trained.
+        self.keyframes_abs_pos_embedding = (
+            torch.nn.Parameter(torch.zeros(1, self.inner_dim)) if self.use_keyframes_abs_pos_embedding else None
+        )
 
-        # Video caption projection
-        self.caption_projection = PixArtAlphaTextProjection(
-            in_features=caption_channels,
-            hidden_size=self.inner_dim,
+        self.adaln_single = AdaLayerNormSingle(self.inner_dim, embedding_coefficient=self._adaln_embedding_coefficient)
+
+        self.prompt_adaln_single = (
+            AdaLayerNormSingle(self.inner_dim, embedding_coefficient=2)
+            if self.cross_attention_adaln and self.use_prompt_adaln_single
+            else None
         )
 
         # Video output components
@@ -143,22 +235,25 @@ class LTXModel(torch.nn.Module):
         self,
         in_channels: int,
         out_channels: int,
-        caption_channels: int,
         norm_eps: float,
+        caption_projection: torch.nn.Module | None = None,
     ) -> None:
         """Initialize audio-specific components."""
 
         # Audio input components
         self.audio_patchify_proj = torch.nn.Linear(in_channels, self.audio_inner_dim, bias=True)
+        if caption_projection is not None:
+            self.audio_caption_projection = caption_projection
 
         self.audio_adaln_single = AdaLayerNormSingle(
             self.audio_inner_dim,
+            embedding_coefficient=self._adaln_embedding_coefficient,
         )
 
-        # Audio caption projection
-        self.audio_caption_projection = PixArtAlphaTextProjection(
-            in_features=caption_channels,
-            hidden_size=self.audio_inner_dim,
+        self.audio_prompt_adaln_single = (
+            AdaLayerNormSingle(self.audio_inner_dim, embedding_coefficient=2)
+            if self.cross_attention_adaln and self.use_prompt_adaln_single
+            else None
         )
 
         # Audio output components
@@ -201,7 +296,6 @@ class LTXModel(torch.nn.Module):
             self.video_args_preprocessor = MultiModalTransformerArgsPreprocessor(
                 patchify_proj=self.patchify_proj,
                 adaln=self.adaln_single,
-                caption_projection=self.caption_projection,
                 cross_scale_shift_adaln=self.av_ca_video_scale_shift_adaln_single,
                 cross_gate_adaln=self.av_ca_a2v_gate_adaln_single,
                 inner_dim=self.inner_dim,
@@ -215,11 +309,13 @@ class LTXModel(torch.nn.Module):
                 positional_embedding_theta=self.positional_embedding_theta,
                 rope_type=self.rope_type,
                 av_ca_timestep_scale_multiplier=self.av_ca_timestep_scale_multiplier,
+                caption_projection=getattr(self, "caption_projection", None),
+                prompt_adaln=getattr(self, "prompt_adaln_single", None),
+                keyframes_embedding_provider=self._keyframes_embedding,
             )
             self.audio_args_preprocessor = MultiModalTransformerArgsPreprocessor(
                 patchify_proj=self.audio_patchify_proj,
                 adaln=self.audio_adaln_single,
-                caption_projection=self.audio_caption_projection,
                 cross_scale_shift_adaln=self.av_ca_audio_scale_shift_adaln_single,
                 cross_gate_adaln=self.av_ca_v2a_gate_adaln_single,
                 inner_dim=self.audio_inner_dim,
@@ -233,12 +329,13 @@ class LTXModel(torch.nn.Module):
                 positional_embedding_theta=self.positional_embedding_theta,
                 rope_type=self.rope_type,
                 av_ca_timestep_scale_multiplier=self.av_ca_timestep_scale_multiplier,
+                caption_projection=getattr(self, "audio_caption_projection", None),
+                prompt_adaln=getattr(self, "audio_prompt_adaln_single", None),
             )
         elif self.model_type.is_video_enabled():
             self.video_args_preprocessor = TransformerArgsPreprocessor(
                 patchify_proj=self.patchify_proj,
                 adaln=self.adaln_single,
-                caption_projection=self.caption_projection,
                 inner_dim=self.inner_dim,
                 max_pos=self.positional_embedding_max_pos,
                 num_attention_heads=self.num_attention_heads,
@@ -247,12 +344,14 @@ class LTXModel(torch.nn.Module):
                 double_precision_rope=self.double_precision_rope,
                 positional_embedding_theta=self.positional_embedding_theta,
                 rope_type=self.rope_type,
+                caption_projection=getattr(self, "caption_projection", None),
+                prompt_adaln=getattr(self, "prompt_adaln_single", None),
+                keyframes_embedding_provider=self._keyframes_embedding,
             )
         elif self.model_type.is_audio_enabled():
             self.audio_args_preprocessor = TransformerArgsPreprocessor(
                 patchify_proj=self.audio_patchify_proj,
                 adaln=self.audio_adaln_single,
-                caption_projection=self.audio_caption_projection,
                 inner_dim=self.audio_inner_dim,
                 max_pos=self.audio_positional_embedding_max_pos,
                 num_attention_heads=self.audio_num_attention_heads,
@@ -261,6 +360,8 @@ class LTXModel(torch.nn.Module):
                 double_precision_rope=self.double_precision_rope,
                 positional_embedding_theta=self.positional_embedding_theta,
                 rope_type=self.rope_type,
+                caption_projection=getattr(self, "audio_caption_projection", None),
+                prompt_adaln=getattr(self, "audio_prompt_adaln_single", None),
             )
 
     def _init_transformer_blocks(
@@ -271,7 +372,10 @@ class LTXModel(torch.nn.Module):
         audio_attention_head_dim: int,
         audio_cross_attention_dim: int,
         norm_eps: float,
-        attention_type: AttentionFunction | AttentionCallable,
+        ops: TransformerOpsConfig,
+        apply_gated_attention: bool,
+        ff_bias: bool = True,
+        audio_ff_bias: bool = True,
     ) -> None:
         """Initialize transformer blocks for LTX."""
         video_config = (
@@ -280,6 +384,9 @@ class LTXModel(torch.nn.Module):
                 heads=self.num_attention_heads,
                 d_head=attention_head_dim,
                 context_dim=cross_attention_dim,
+                apply_gated_attention=apply_gated_attention,
+                cross_attention_adaln=self.cross_attention_adaln,
+                ff_bias=ff_bias,
             )
             if self.model_type.is_video_enabled()
             else None
@@ -290,6 +397,9 @@ class LTXModel(torch.nn.Module):
                 heads=self.audio_num_attention_heads,
                 d_head=audio_attention_head_dim,
                 context_dim=audio_cross_attention_dim,
+                apply_gated_attention=apply_gated_attention,
+                cross_attention_adaln=self.cross_attention_adaln,
+                ff_bias=audio_ff_bias,
             )
             if self.model_type.is_audio_enabled()
             else None
@@ -297,14 +407,13 @@ class LTXModel(torch.nn.Module):
         self.transformer_blocks = torch.nn.ModuleList(
             [
                 BasicAVTransformerBlock(
-                    idx=idx,
                     video=video_config,
                     audio=audio_config,
                     rope_type=self.rope_type,
                     norm_eps=norm_eps,
-                    attention_function=attention_type,
+                    ops=ops,
                 )
-                for idx in range(num_layers)
+                for _ in range(num_layers)
             ]
         )
 
@@ -318,33 +427,45 @@ class LTXModel(torch.nn.Module):
         """
         self._enable_gradient_checkpointing = enable
 
+    @property
+    def num_blocks(self) -> int:
+        """Number of transformer blocks."""
+        return len(self.transformer_blocks)
+
     def _process_transformer_blocks(
         self,
         video: TransformerArgs | None,
         audio: TransformerArgs | None,
         perturbations: BatchedPerturbationConfig,
-    ) -> tuple[TransformerArgs, TransformerArgs]:
-        """Process transformer blocks for LTXAV."""
+    ) -> tuple[TransformerArgs | None, TransformerArgs | None]:
+        """Process transformer blocks for LTX."""
+        for block_idx, block in enumerate(self.transformer_blocks):
+            if video is not None:
+                video = self.block_input_processor(
+                    video,
+                    perturbations,
+                    block_idx,
+                    self_attn_type=PerturbationType.SKIP_VIDEO_SELF_ATTN,
+                    cross_attn_type=PerturbationType.SKIP_A2V_CROSS_ATTN,
+                )
+            if audio is not None:
+                audio = self.block_input_processor(
+                    audio,
+                    perturbations,
+                    block_idx,
+                    self_attn_type=PerturbationType.SKIP_AUDIO_SELF_ATTN,
+                    cross_attn_type=PerturbationType.SKIP_V2A_CROSS_ATTN,
+                )
 
-        # Process transformer blocks
-        for block in self.transformer_blocks:
             if self._enable_gradient_checkpointing and self.training:
-                # Use gradient checkpointing to save memory during training.
-                # With use_reentrant=False, we can pass dataclasses directly -
-                # PyTorch will track all tensor leaves in the computation graph.
                 video, audio = torch.utils.checkpoint.checkpoint(
                     block,
                     video,
                     audio,
-                    perturbations,
                     use_reentrant=False,
                 )
             else:
-                video, audio = block(
-                    video=video,
-                    audio=audio,
-                    perturbations=perturbations,
-                )
+                video, audio = block(video=video, audio=audio)
 
         return video, audio
 
@@ -369,8 +490,8 @@ class LTXModel(torch.nn.Module):
         return x
 
     def forward(
-        self, video: Modality | None, audio: Modality | None, perturbations: BatchedPerturbationConfig
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+        self, video: Modality | None, audio: Modality | None, perturbations: BatchedPerturbationConfig | None
+    ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
         """
         Forward pass for LTX models.
         Returns:
@@ -381,8 +502,13 @@ class LTXModel(torch.nn.Module):
         if not self.model_type.is_audio_enabled() and audio is not None:
             raise ValueError("Audio is not enabled for this model")
 
-        video_args = self.video_args_preprocessor.prepare(video) if video is not None else None
-        audio_args = self.audio_args_preprocessor.prepare(audio) if audio is not None else None
+        video_args = self.video_args_preprocessor.prepare(video, audio) if video is not None else None
+        audio_args = self.audio_args_preprocessor.prepare(audio, video) if audio is not None else None
+        # Materialize the no-perturbation mask here (eager); a None config means "perturb nothing"
+        # -> all-keep masks. The block loop never builds masks.
+        if perturbations is None:
+            ref = (video_args or audio_args).x
+            perturbations = BatchedPerturbationConfig.empty(ref.shape[0], self.num_blocks, ref.device, ref.dtype)
         # Process transformer blocks
         video_out, audio_out = self._process_transformer_blocks(
             video=video_args,
@@ -412,15 +538,20 @@ class LTXModel(torch.nn.Module):
         return vx, ax
 
 
-class LegacyX0Model(torch.nn.Module):
+class LegacyX0Model(torch.nn.Module, Disposable):
     """
     Legacy X0 model implementation.
     Returns fully denoised output based on the velocities produced by the base model.
     """
 
-    def __init__(self, velocity_model: LTXModel):
+    def __init__(self, velocity_model: LTXModelProtocol):
         super().__init__()
         self.velocity_model = velocity_model
+
+    @property
+    def num_blocks(self) -> int:
+        """Number of transformer blocks."""
+        return self.velocity_model.num_blocks
 
     def forward(
         self,
@@ -440,22 +571,27 @@ class LegacyX0Model(torch.nn.Module):
         return denoised_video, denoised_audio
 
 
-class X0Model(torch.nn.Module):
+class X0Model(torch.nn.Module, Disposable):
     """
     X0 model implementation.
     Returns fully denoised outputs based on the velocities produced by the base model.
     Applies scaled denoising to the video and audio according to the timesteps = sigma * denoising_mask.
     """
 
-    def __init__(self, velocity_model: LTXModel):
+    def __init__(self, velocity_model: LTXModelProtocol):
         super().__init__()
         self.velocity_model = velocity_model
+
+    @property
+    def num_blocks(self) -> int:
+        """Number of transformer blocks."""
+        return self.velocity_model.num_blocks
 
     def forward(
         self,
         video: Modality | None,
         audio: Modality | None,
-        perturbations: BatchedPerturbationConfig,
+        perturbations: BatchedPerturbationConfig | None,
     ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
         """
         Denoise the video and audio according to the sigma.

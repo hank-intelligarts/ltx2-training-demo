@@ -5,11 +5,13 @@ The foundational library for the LTX-2 Audio-Video generation model. This packag
 ## 📦 What's Inside?
 
 - **`components/`**: Modular diffusion components (Schedulers, Guiders, Noisers, Patchifiers) following standard protocols
-- **`conditioning/`**: Tools for preparing latent states and applying conditioning (image, video, keyframes)
+- **`conditioning/`**: Tools for preparing latent states and applying conditioning (image, video, keyframes, generated keyframe slots)
 - **`guidance/`**: Perturbation system for fine-grained control over attention mechanisms
 - **`loader/`**: Utilities for loading weights from `.safetensors`, fusing LoRAs, and managing memory
+- **`block_streaming/`**: Memory-efficient inference that streams transformer blocks through the GPU one at a time (from pinned CPU buffers or directly from disk)
 - **`model/`**: PyTorch implementations of the LTX-2 Transformer, Video VAE, Audio VAE, Vocoder and Upscaler
 - **`text_encoders/gemma`**: Gemma text encoder implementation with tokenizers, feature extractors, and separate encoders for audio-video and video-only generation
+- **`quantization/`**: FP8 (scaled MM, cast), blockwise FP8/FP6, and NVFP4 Linear (via `ltx-kernels`) for reduced memory / faster GEMM.
 
 ## 🚀 Quick Start
 
@@ -47,12 +49,147 @@ pip install -e packages/ltx-core
 
 ### Conditioning & Control
 
-- **Conditioning** ([`conditioning/`](src/ltx_core/conditioning/)): Tools for preparing and applying various conditioning types (image, video, keyframes)
+- **Conditioning** ([`conditioning/`](src/ltx_core/conditioning/)): Tools for preparing and applying various conditioning types (image, video, keyframes, and generated keyframe slots via `VideoGeneratedKeyframeSlots` -- extra model-generated frames at interior positions, requiring a checkpoint whose transformer config sets `use_keyframes_abs_pos_embedding`)
 - **Guidance** ([`guidance/`](src/ltx_core/guidance/)): Perturbation system for fine-grained control over attention mechanisms (e.g., skipping specific attention layers)
 
 ### Utilities
 
 - **Loader** ([`loader/`](src/ltx_core/loader/)): Model loading from `.safetensors`, LoRA fusion, weight remapping, and memory management
+- **Quantization** ([`quantization/`](src/ltx_core/quantization/)): FP8, blockwise FP8/FP6, and NVFP4 Linear policies for reduced memory footprint and faster inference
+- **Block Streaming** ([`block_streaming/`](src/ltx_core/block_streaming/)): Streams transformer blocks through the GPU one block at a time, so the full model runs on machines without enough memory to hold all its weights at once
+- **Colour / HDR** ([`color/`](src/ltx_core/color/), [`hdr.py`](src/ltx_core/hdr.py)): Primaries matrices, YUV/HLG helpers, and working-space transfers used by pipeline EXR/`--hdr` I/O. Pipeline-level docs: [HDR Support](../ltx-pipelines/docs/hdr.md).
+
+### Loader
+
+The `loader/` module provides `SingleGPUModelBuilder`, a frozen dataclass that loads a PyTorch model from `.safetensors` checkpoints and optionally fuses one or more LoRA adapters.
+
+#### Basic usage
+
+```python
+from ltx_core.loader import SingleGPUModelBuilder
+
+builder = SingleGPUModelBuilder(
+    model_class_configurator=MyModelConfigurator,
+    model_path="/path/to/model.safetensors",
+)
+model = builder.build(device=torch.device("cuda"))
+```
+
+#### Loading LoRA adapters
+
+Use the `.lora()` method to attach one or more LoRA adapters before calling `.build()`:
+
+```python
+from ltx_core.loader import SDOps
+
+lora_sd_ops = SDOps(name="identity").with_matching()  # or a model-specific key-renaming SDOps
+
+builder = (
+    SingleGPUModelBuilder(
+        model_class_configurator=MyModelConfigurator,
+        model_path="/path/to/model.safetensors",
+    )
+    .lora("/path/to/lora_a.safetensors", 0.8, lora_sd_ops)
+    .lora("/path/to/lora_b.safetensors", 0.5, lora_sd_ops)
+)
+model = builder.build(device=torch.device("cuda"))
+```
+
+#### Memory-efficient LoRA loading (`lora_load_device`)
+
+By default, LoRA weights are loaded onto the **CPU** (`lora_load_device=torch.device("cpu")`).  This means each LoRA adapter is kept in CPU memory and transferred to the GPU sequentially during weight fusion, which keeps peak GPU memory low even when fusing large adapters.
+
+If all adapters fit comfortably in GPU memory you can skip the CPU staging by setting `lora_load_device` to the target CUDA device:
+
+```python
+import torch
+from ltx_core.loader import SingleGPUModelBuilder
+
+# Load LoRA weights directly onto the GPU (faster, but uses more GPU memory)
+builder = SingleGPUModelBuilder(
+    model_class_configurator=MyModelConfigurator,
+    model_path="/path/to/model.safetensors",
+    lora_load_device=torch.device("cuda"),
+).lora("/path/to/lora.safetensors", 1.0, lora_sd_ops)
+
+model = builder.build(device=torch.device("cuda"))
+```
+
+### Quantization
+
+The `quantization/` module provides FP8 quantization support for the LTX-2 transformer, significantly reducing memory usage while maintaining quality. Two backends are available:
+
+#### FP8 Scaled MM
+
+Uses PyTorch's `torch._scaled_mm` for efficient FP8 matrix multiplication. Weights are stored in FP8 format with per-tensor scaling, and inputs are quantized dynamically.
+
+**Usage with QuantizationPolicy:**
+
+```python
+from ltx_core.quantization.fp8_scaled_mm import build_policy as build_fp8_scaled_mm_policy
+
+# Discovers the layer set from the checkpoint's .weight_scale tensors
+policy = build_fp8_scaled_mm_policy("/path/to/checkpoint.safetensors")
+```
+
+The policy carries `sd_ops`, `module_ops`, and `fuse_rule` that are passed to the model builder:
+
+```python
+import torch
+from ltx_core.loader import SingleGPUModelBuilder
+
+builder = SingleGPUModelBuilder(
+    model_class_configurator=MyModelConfigurator,
+    model_path="/path/to/checkpoint.safetensors",
+    model_sd_ops=policy.sd_ops,
+    module_ops=policy.module_ops,
+    fuse_rule=policy.fuse_rule,
+)
+model = builder.build(device=torch.device("cuda"))
+```
+
+#### FP8 Cast
+
+A simpler approach that casts weights to FP8 for storage and upcasts during inference:
+
+```python
+from ltx_core.quantization.fp8_cast import build_policy as build_fp8_cast_policy
+
+policy = build_fp8_cast_policy("/path/to/checkpoint.safetensors")
+```
+
+### Block Streaming
+
+The `block_streaming/` module ([`src/ltx_core/block_streaming/`](src/ltx_core/block_streaming/)) lets the full model run on machines that lack the memory to hold all of its weights at once. It streams the transformer's blocks through a small rolling set of GPU buffers, loading each block's weights just before it runs and recycling them afterwards, so only a few blocks are resident on the GPU at any moment. Construct it with `StreamingModelBuilder`, which returns a `BlockStreamingWrapper` -- an `nn.Module` drop-in for the wrapped model.
+
+#### Strategies
+
+The strategy is chosen automatically from `cpu_slots_count` relative to the number of blocks:
+
+- **RAM streaming** (default, `cpu_slots_count` omitted or `>= num_blocks`): all blocks are pre-loaded into pinned CPU buffers (with LoRA fusion) at build time, then copied to the GPU on demand. Fast; higher CPU memory.
+- **Disk streaming** (`cpu_slots_count < num_blocks`): blocks are read from the `.safetensors` file on demand on a background worker thread. Slower; lowest CPU memory.
+
+#### Basic usage
+
+```python
+import torch
+from ltx_core.block_streaming import StreamingModelBuilder
+
+builder = StreamingModelBuilder(
+    model_class_configurator=MyModelConfigurator,
+    model_path="/path/to/model.safetensors",
+    blocks_attr="transformer_blocks",      # dotted path to the nn.ModuleList
+    blocks_prefix="transformer_blocks",    # state-dict key prefix for block weights
+)
+
+# Omit cpu_slots_count for RAM streaming; pass a value < num_blocks for disk streaming.
+model = builder.build(
+    device=torch.device("cuda"),
+    dtype=torch.bfloat16,
+    cpu_slots_count=4,
+    gpu_slots_count=2,
+)
+```
 
 For complete, production-ready pipeline implementations that combine these building blocks, see the [`ltx-pipelines`](../ltx-pipelines/) package.
 
@@ -198,6 +335,10 @@ The Video VAE ([`src/ltx_core/model/video_vae/`](src/ltx_core/model/video_vae/))
   - Where `F' = 1 + (F-1)*8`
   - Example: `[B, 128, 5, 16, 16]` → `[B, 3, 33, 512, 512]`
 
+`ConvVideoDecoder` (above) is the default, single-forward-pass decoder. `model/video_vae/` also has `DiffusionVideoDecoder` -- a neighborhood-attention decoder (for best performance requires the `natten` extra: `uv sync --package ltx-core --extra natten`; without it, Triton or eager fallbacks are used) that iteratively denoises pixels via Euler steps (`default_num_inference_steps=2` for distilled) instead of a single deterministic pass. `VideoDecoderConfigurator.from_config` picks between the two based on the checkpoint's own `vae._class_name`. `DIFFUSION_VAE_DECODER_COMFY_KEYS_FILTER` is its checkpoint key-remapping `SDOps`. Pipeline-side DiffVAE presets live in `DiffVAEMode` / `apply_diffvae_mode` (default `CHUNKED_EAGER`; CLI `--diffvae-optimization`). See `ltx-pipelines` docs for relative compile/runtime/VRAM tradeoffs between modes.
+
+> **DiffVAE + CUDA illegal memory access:** the `natten` extra pins `natten==0.21.7+torch2130cu132` with `torch==2.13.0` (cu132). Older PyTorch/NVIDIA stacks can IMA inside NATTEN TokPerm on large stage-5 volumes. If that happens, upgrade CUDA / PyTorch / natten to those pins (see also [pipelines optimization docs](../ltx-pipelines/docs/optimization.md#diffusion-vae-decoder)).
+
 The Video VAE is used internally by pipelines for encoding video pixels to latents and decoding latents back to pixels. For usage examples, see the [`ltx-pipelines`](../ltx-pipelines/) package.
 
 ---
@@ -225,7 +366,18 @@ The Audio VAE is used internally by pipelines for encoding mel spectrograms to l
 
 ## Text Encoding (Gemma)
 
-LTX-2 uses **Gemma 3** (Gemma 3-12B) as the multilingual text encoder backbone, located in [`src/ltx_core/text_encoders/gemma/`](src/ltx_core/text_encoders/gemma/). Advanced text understanding is critical not only for global language support but for the phonetic and semantic accuracy of generated speech.
+LTX-2 uses Gemma as the multilingual text encoder backbone, located in [`src/ltx_core/text_encoders/gemma/`](src/ltx_core/text_encoders/gemma/). LTX-2.3 uses stock **Gemma 3** (12B), downloaded separately; LTX-2.5 uses a **Gemma 4** (unified) fine-tuned for LTX and shipped with the model. Advanced text understanding is critical not only for global language support but for the phonetic and semantic accuracy of generated speech.
+
+### Tokenization and BOS
+
+Encoding goes through [`LTXGemmaTokenizer`](src/ltx_core/text_encoders/gemma/tokenizer.py), which always ensures a leading `<bos>`:
+
+| Family | Tokenizer assets prepend `<bos>`? | Encode path |
+|--------|-----------------------------------|-------------|
+| Gemma 3 | Yes (`tokenizer.json` post_processor) | Leading `<bos>` already from assets |
+| Gemma 4 | No | We prepend `<bos>` so both families match |
+
+EOS is not appended on the encode path.
 
 ### Text Encoder Architecture
 
@@ -286,7 +438,8 @@ Here's how all the components work together conceptually ([`src/ltx_core/compone
 6. **Unpatchification**: Convert sequence back to spatial format
 7. **VAE Decoding**: Decode latents to pixel space (with optional upsampling for two-stage)
 
-- [`TI2VidTwoStagesPipeline`](../ltx-pipelines/src/ltx_pipelines/ti2vid_two_stages.py) - Two-stage text-to-video (recommended)
+- [`DFRPipeline`](../ltx-pipelines/src/ltx_pipelines/dfr_pipeline.py) - Production-quality text/image-to-video
+- [`TI2VidTwoStagesPipeline`](../ltx-pipelines/src/ltx_pipelines/ti2vid_two_stages.py) - Guided two-stage text-to-video
 - [`ICLoraPipeline`](../ltx-pipelines/src/ltx_pipelines/ic_lora.py) - Video-to-video with IC-LoRA control
 - [`DistilledPipeline`](../ltx-pipelines/src/ltx_pipelines/distilled.py) - Fast inference with distilled model
 - [`KeyframeInterpolationPipeline`](../ltx-pipelines/src/ltx_pipelines/keyframe_interpolation.py) - Keyframe-based interpolation

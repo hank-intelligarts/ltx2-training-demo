@@ -1,29 +1,41 @@
-from dataclasses import replace
-from typing import Any, Callable, Iterator, List, Tuple
+import itertools
+import logging
+from collections.abc import Sequence
+from typing import Any, Callable, Iterator, List, Protocol, Tuple
 
 import torch
-from einops import rearrange
 from torch import nn
 
 from ltx_core.model.common.normalization import PixelNorm
-from ltx_core.model.transformer.timestep_embedding import PixArtAlphaCombinedTimestepSizeEmbeddings
+from ltx_core.model.disposable import Disposable
+from ltx_core.model.transformer.attention import AttentionCallable, AttentionFunction
+from ltx_core.model.video_vae.attention import AttnBlock3D
 from ltx_core.model.video_vae.convolution import make_conv_nd
 from ltx_core.model.video_vae.enums import LogVarianceType, NormLayerType, PaddingModeType
-from ltx_core.model.video_vae.ops import PerChannelStatistics, patchify, unpatchify
+from ltx_core.model.video_vae.keyframes import DecodeKeyframes
+from ltx_core.model.video_vae.ops import PerChannelStatistics, patchify
 from ltx_core.model.video_vae.resnet import ResnetBlock3D, UNetMidBlock3D
-from ltx_core.model.video_vae.sampling import DepthToSpaceUpsample, SpaceToDepthDownsample
-from ltx_core.model.video_vae.tiling import (
+from ltx_core.model.video_vae.sampling import SpaceToDepthDownsample
+from ltx_core.tiling import (
     DEFAULT_MAPPING_OPERATION,
     DEFAULT_SPLIT_OPERATION,
     DimensionIntervals,
     MappingOperation,
-    SplitOperation,
     Tile,
+    TileCountConfig,
+    TileSizeConfig,
     TilingConfig,
+    _validate_overlap,
+    compute_rectangular_mask_1d,
     compute_trapezoidal_mask_1d,
     create_tiles,
+    masks_are_complementary,
+    scale_by_masks_1d,
+    untiled_mask_1d,
 )
-from ltx_core.types import SpatioTemporalScaleFactors, VideoLatentShape
+from ltx_core.types import VIDEO_SCALE_FACTORS, SpatioTemporalScaleFactors, VideoLatentShape
+
+logger: logging.Logger = logging.getLogger(__name__)
 
 
 def _make_encoder_block(
@@ -34,6 +46,7 @@ def _make_encoder_block(
     norm_layer: NormLayerType,
     norm_num_groups: int,
     spatial_padding_mode: PaddingModeType,
+    attention: AttentionFunction | AttentionCallable,
 ) -> Tuple[nn.Module, int]:
     out_channels = in_channels
 
@@ -126,13 +139,15 @@ def _make_encoder_block(
             stride=(2, 1, 1),
             spatial_padding_mode=spatial_padding_mode,
         )
+    elif block_name == "attn":
+        block = AttnBlock3D(in_channels=in_channels, attention=attention)
     else:
         raise ValueError(f"unknown block: {block_name}")
 
     return block, out_channels
 
 
-class VideoEncoder(nn.Module):
+class VideoEncoder(nn.Module, Disposable):
     _DEFAULT_NORM_NUM_GROUPS = 32
     """
     Variational Autoencoder Encoder. Encodes video frames into a latent representation.
@@ -174,6 +189,7 @@ class VideoEncoder(nn.Module):
         norm_layer: NormLayerType = NormLayerType.PIXEL_NORM,
         latent_log_var: LogVarianceType = LogVarianceType.UNIFORM,
         encoder_spatial_padding_mode: PaddingModeType = PaddingModeType.ZEROS,
+        attention: AttentionFunction | AttentionCallable = AttentionFunction.PYTORCH,
     ):
         super().__init__()
 
@@ -182,6 +198,8 @@ class VideoEncoder(nn.Module):
         self.latent_channels = out_channels
         self.latent_log_var = latent_log_var
         self._norm_num_groups = self._DEFAULT_NORM_NUM_GROUPS
+        # Spatiotemporal downscaling derived from the block list (see SpatioTemporalScaleFactors.from_blocks).
+        self.video_scale_factors = SpatioTemporalScaleFactors.from_blocks(encoder_blocks, patch_size)
 
         # Per-channel statistics for normalizing latents
         self.per_channel_statistics = PerChannelStatistics(latent_channels=out_channels)
@@ -214,6 +232,7 @@ class VideoEncoder(nn.Module):
                 norm_layer=norm_layer,
                 norm_num_groups=self._norm_num_groups,
                 spatial_padding_mode=encoder_spatial_padding_mode,
+                attention=attention,
             )
 
             self.down_blocks.append(block)
@@ -248,18 +267,25 @@ class VideoEncoder(nn.Module):
         r"""
         Encode video frames into normalized latent representation.
         Args:
-            sample: Input video (B, C, F, H, W). F must be 1 + 8*k (e.g., 1, 9, 17, 25, 33...).
+            sample: Input video (B, C, F, H, W). F should be 1 + 8*k (e.g., 1, 9, 17, 25, 33...).
+                If not, the encoder crops the last frames to the nearest valid length.
+                Should be normalized to [-1, 1] range before encoding.
         Returns:
             Normalized latent means (B, 128, F', H', W') where F' = 1+(F-1)/8, H' = H/32, W' = W/32.
             Example: (B, 3, 33, 512, 512) -> (B, 128, 5, 16, 16).
         """
-        # Validate frame count
+        # Validate frame count (crop to nearest valid length if needed)
+        temporal_factor = self.video_scale_factors.time
         frames_count = sample.shape[2]
-        if ((frames_count - 1) % 8) != 0:
-            raise ValueError(
-                "Invalid number of frames: Encode input must have 1 + 8 * x frames "
-                "(e.g., 1, 9, 17, ...). Please check your input."
+        if ((frames_count - 1) % temporal_factor) != 0:
+            frames_to_crop = (frames_count - 1) % temporal_factor
+            logger.warning(
+                "Invalid number of frames %s for encode; cropping last %s frames to satisfy 1 + %s*k.",
+                frames_count,
+                frames_to_crop,
+                temporal_factor,
             )
+            sample = sample[:, :, :-frames_to_crop, ...]
 
         # Initial spatial compression: trade spatial resolution for channel depth
         # This reduces H,W by patch_size and increases channels, making convolutions more efficient
@@ -311,596 +337,261 @@ class VideoEncoder(nn.Module):
         means, _ = torch.chunk(sample, 2, dim=1)
         return self.per_channel_statistics.normalize(means)
 
-
-def _make_decoder_block(
-    block_name: str,
-    block_config: dict[str, Any],
-    in_channels: int,
-    convolution_dimensions: int,
-    norm_layer: NormLayerType,
-    timestep_conditioning: bool,
-    norm_num_groups: int,
-    spatial_padding_mode: PaddingModeType,
-) -> Tuple[nn.Module, int]:
-    out_channels = in_channels
-    if block_name == "res_x":
-        block = UNetMidBlock3D(
-            dims=convolution_dimensions,
-            in_channels=in_channels,
-            num_layers=block_config["num_layers"],
-            resnet_eps=1e-6,
-            resnet_groups=norm_num_groups,
-            norm_layer=norm_layer,
-            inject_noise=block_config.get("inject_noise", False),
-            timestep_conditioning=timestep_conditioning,
-            spatial_padding_mode=spatial_padding_mode,
-        )
-    elif block_name == "attn_res_x":
-        block = UNetMidBlock3D(
-            dims=convolution_dimensions,
-            in_channels=in_channels,
-            num_layers=block_config["num_layers"],
-            resnet_groups=norm_num_groups,
-            norm_layer=norm_layer,
-            inject_noise=block_config.get("inject_noise", False),
-            timestep_conditioning=timestep_conditioning,
-            attention_head_dim=block_config["attention_head_dim"],
-            spatial_padding_mode=spatial_padding_mode,
-        )
-    elif block_name == "res_x_y":
-        out_channels = in_channels // block_config.get("multiplier", 2)
-        block = ResnetBlock3D(
-            dims=convolution_dimensions,
-            in_channels=in_channels,
-            out_channels=out_channels,
-            eps=1e-6,
-            groups=norm_num_groups,
-            norm_layer=norm_layer,
-            inject_noise=block_config.get("inject_noise", False),
-            timestep_conditioning=False,
-            spatial_padding_mode=spatial_padding_mode,
-        )
-    elif block_name == "compress_time":
-        block = DepthToSpaceUpsample(
-            dims=convolution_dimensions,
-            in_channels=in_channels,
-            stride=(2, 1, 1),
-            spatial_padding_mode=spatial_padding_mode,
-        )
-    elif block_name == "compress_space":
-        block = DepthToSpaceUpsample(
-            dims=convolution_dimensions,
-            in_channels=in_channels,
-            stride=(1, 2, 2),
-            spatial_padding_mode=spatial_padding_mode,
-        )
-    elif block_name == "compress_all":
-        out_channels = in_channels // block_config.get("multiplier", 1)
-        block = DepthToSpaceUpsample(
-            dims=convolution_dimensions,
-            in_channels=in_channels,
-            stride=(2, 2, 2),
-            residual=block_config.get("residual", False),
-            out_channels_reduction_factor=block_config.get("multiplier", 1),
-            spatial_padding_mode=spatial_padding_mode,
-        )
-    else:
-        raise ValueError(f"unknown layer: {block_name}")
-
-    return block, out_channels
-
-
-class VideoDecoder(nn.Module):
-    _DEFAULT_NORM_NUM_GROUPS = 32
-    """
-    Variational Autoencoder Decoder. Decodes latent representation into video frames.
-    The decoder upsamples latents through a series of upsampling operations (inverse of encoder).
-    Output dimensions: F = 8x(F'-1) + 1, H = 32xH', W = 32xW' for standard LTX Video configuration.
-    Upsampling blocks expand dimensions by 2x in specified dimensions:
-        - "compress_time": temporal only
-        - "compress_space": spatial only (H and W)
-        - "compress_all": all dimensions (F, H, W)
-        - "res_x" / "res_x_y" / "attn_res_x": no upsampling
-    Causal Mode:
-        causal=False (standard): Symmetric padding, allows future frame dependencies.
-        causal=True: Causal padding, each frame depends only on past/current frames.
-        First frame removed after temporal upsampling in both modes. Output shape unchanged.
-        Example: (B, 128, 5, 16, 16) -> (B, 3, 33, 512, 512) for both modes.
-    Args:
-        convolution_dimensions: The number of dimensions to use in convolutions (2D or 3D).
-        in_channels: The number of input channels (latent channels). Default is 128.
-        out_channels: The number of output channels. For RGB images, this is 3.
-        decoder_blocks: The list of blocks to construct the decoder. Each block is a tuple of (block_name, params)
-                        where params is either an int (num_layers) or a dict with configuration.
-        patch_size: Final spatial expansion factor. For standard LTX Video, use 4 for 4x spatial expansion:
-                    H -> Hx4, W -> Wx4. Should be a power of 2.
-        norm_layer: The normalization layer to use. Can be either `group_norm` or `pixel_norm`.
-        causal: Whether to use causal convolutions. For standard LTX Video, use False for symmetric padding.
-                When True, uses causal padding (past/current frames only).
-        timestep_conditioning: Whether to condition the decoder on timestep for denoising.
-    """
-
-    def __init__(
+    def tiled_encode(
         self,
-        convolution_dimensions: int = 3,
-        in_channels: int = 128,
-        out_channels: int = 3,
-        decoder_blocks: List[Tuple[str, int | dict]] = [],  # noqa: B006
-        patch_size: int = 4,
-        norm_layer: NormLayerType = NormLayerType.PIXEL_NORM,
-        causal: bool = False,
-        timestep_conditioning: bool = False,
-        decoder_spatial_padding_mode: PaddingModeType = PaddingModeType.REFLECT,
-    ):
-        super().__init__()
-
-        # Spatiotemporal downscaling between decoded video space and VAE latents.
-        # According to the LTXV paper, the standard configuration downsamples
-        # video inputs by a factor of 8 in the temporal dimension and 32 in
-        # each spatial dimension (height and width). This parameter determines how
-        # many video frames and pixels correspond to a single latent cell.
-        self.video_downscale_factors = SpatioTemporalScaleFactors(
-            time=8,
-            width=32,
-            height=32,
-        )
-
-        self.patch_size = patch_size
-        out_channels = out_channels * patch_size**2
-        self.causal = causal
-        self.timestep_conditioning = timestep_conditioning
-        self._norm_num_groups = self._DEFAULT_NORM_NUM_GROUPS
-
-        # Per-channel statistics for denormalizing latents
-        self.per_channel_statistics = PerChannelStatistics(latent_channels=in_channels)
-
-        # Noise and timestep parameters for decoder conditioning
-        self.decode_noise_scale = 0.025
-        self.decode_timestep = 0.05
-
-        # Compute initial feature_channels by going through blocks in reverse
-        # This determines the channel width at the start of the decoder
-        feature_channels = in_channels
-        for block_name, block_params in list(reversed(decoder_blocks)):
-            block_config = block_params if isinstance(block_params, dict) else {}
-            if block_name == "res_x_y":
-                feature_channels = feature_channels * block_config.get("multiplier", 2)
-            if block_name == "compress_all":
-                feature_channels = feature_channels * block_config.get("multiplier", 1)
-
-        self.conv_in = make_conv_nd(
-            dims=convolution_dimensions,
-            in_channels=in_channels,
-            out_channels=feature_channels,
-            kernel_size=3,
-            stride=1,
-            padding=1,
-            causal=True,
-            spatial_padding_mode=decoder_spatial_padding_mode,
-        )
-
-        self.up_blocks = nn.ModuleList([])
-
-        for block_name, block_params in list(reversed(decoder_blocks)):
-            # Convert int to dict format for uniform handling
-            block_config = {"num_layers": block_params} if isinstance(block_params, int) else block_params
-
-            block, feature_channels = _make_decoder_block(
-                block_name=block_name,
-                block_config=block_config,
-                in_channels=feature_channels,
-                convolution_dimensions=convolution_dimensions,
-                norm_layer=norm_layer,
-                timestep_conditioning=timestep_conditioning,
-                norm_num_groups=self._norm_num_groups,
-                spatial_padding_mode=decoder_spatial_padding_mode,
-            )
-
-            self.up_blocks.append(block)
-
-        if norm_layer == NormLayerType.GROUP_NORM:
-            self.conv_norm_out = nn.GroupNorm(num_channels=feature_channels, num_groups=self._norm_num_groups, eps=1e-6)
-        elif norm_layer == NormLayerType.PIXEL_NORM:
-            self.conv_norm_out = PixelNorm()
-
-        self.conv_act = nn.SiLU()
-        self.conv_out = make_conv_nd(
-            dims=convolution_dimensions,
-            in_channels=feature_channels,
-            out_channels=out_channels,
-            kernel_size=3,
-            padding=1,
-            causal=True,
-            spatial_padding_mode=decoder_spatial_padding_mode,
-        )
-
-        if timestep_conditioning:
-            self.timestep_scale_multiplier = nn.Parameter(torch.tensor(1000.0))
-            self.last_time_embedder = PixArtAlphaCombinedTimestepSizeEmbeddings(
-                embedding_dim=feature_channels * 2, size_emb_dim=0
-            )
-            self.last_scale_shift_table = nn.Parameter(torch.empty(2, feature_channels))
-
-    def forward(
-        self,
-        sample: torch.Tensor,
-        timestep: torch.Tensor | None = None,
-        generator: torch.Generator | None = None,
+        video: torch.Tensor,
+        tiling_config: TilingConfig | None = None,
     ) -> torch.Tensor:
-        r"""
-        Decode latent representation into video frames.
+        """Encode video to latent using tiled processing of the given video tensor.
+        Device Handling:
+            - Input video can be on CPU or GPU
+            - Accumulation buffers are created on model's device
+            - Each tile is automatically moved to model's device before encoding
+            - Output latent is returned on model's device
         Args:
-            sample: Latent tensor (B, 128, F', H', W').
-            timestep: Timestep for conditioning (if timestep_conditioning=True). Uses default 0.05 if None.
-            generator: Random generator for deterministic noise injection (if inject_noise=True in blocks).
+            video: Input video tensor (B, 3, F, H, W) in range [-1, 1]
+            tiling_config: Tiling configuration for the video tensor
         Returns:
-            Decoded video (B, 3, F, H, W) where F = 8x(F'-1) + 1, H = 32xH', W = 32xW'.
-            Example: (B, 128, 5, 16, 16) -> (B, 3, 33, 512, 512).
-            Note: First frame is removed after temporal upsampling regardless of causal mode.
-            When causal=False, allows future frame dependencies in convolutions but maintains same output shape.
+            Latent tensor (B, 128, F', H', W') on model's device
+            where F' = 1 + (F-1)/8, H' = H/32, W' = W/32
         """
-        batch_size = sample.shape[0]
+        # Detect model device and dtype
+        model_device = next(self.parameters()).device
+        model_dtype = next(self.parameters()).dtype
 
-        # Add noise if timestep conditioning is enabled
-        if self.timestep_conditioning:
-            noise = (
-                torch.randn(
-                    sample.size(),
-                    generator=generator,
-                    dtype=sample.dtype,
-                    device=sample.device,
-                )
-                * self.decode_noise_scale
+        # Extract shape components
+        batch, _, frames, height, width = video.shape
+
+        # Check frame count and crop if needed
+        if (frames - 1) % self.video_scale_factors.time != 0:
+            frames_to_crop = (frames - 1) % self.video_scale_factors.time
+            logger.warning(
+                f"Number of frames {frames} of input video is not ({self.video_scale_factors.time} * k + 1), "
+                f"last {frames_to_crop} frames will be cropped"
             )
+            video = video[:, :, :-frames_to_crop, ...]
+            # Update frames after cropping
+            frames = video.shape[2]
 
-            sample = noise + (1.0 - self.decode_noise_scale) * sample
+        # Calculate output latent shape (inverse of upscale)
+        latent_shape = VideoLatentShape(
+            batch=batch,
+            channels=self.latent_channels,  # 128 for standard VAE
+            frames=(frames - 1) // self.video_scale_factors.time + 1,
+            height=height // self.video_scale_factors.height,
+            width=width // self.video_scale_factors.width,
+        )
 
-        # Denormalize latents
-        sample = self.per_channel_statistics.un_normalize(sample)
+        # Prepare tiles (operates on VIDEO dimensions)
+        tiles = prepare_tiles_for_encoding(video, tiling_config, scale_factors=self.video_scale_factors)
+        complementary = masks_are_complementary(tiles, latent_shape.to_torch_shape())
 
-        # Use default decode_timestep if timestep not provided
-        if timestep is None and self.timestep_conditioning:
-            timestep = torch.full((batch_size,), self.decode_timestep, device=sample.device, dtype=sample.dtype)
+        # Initialize accumulation buffers on model device
+        latent_buffer = torch.zeros(
+            latent_shape.to_torch_shape(),
+            device=model_device,
+            dtype=model_dtype,
+        )
+        weights_buffer: torch.Tensor | None = None if complementary else torch.zeros_like(latent_buffer)
 
-        sample = self.conv_in(sample, causal=self.causal)
-
-        scaled_timestep = None
-        if self.timestep_conditioning:
-            if timestep is None:
-                raise ValueError("'timestep' parameter must be provided when 'timestep_conditioning' is True")
-            scaled_timestep = timestep * self.timestep_scale_multiplier.to(sample)
-
-        for up_block in self.up_blocks:
-            if isinstance(up_block, UNetMidBlock3D):
-                block_kwargs = {
-                    "causal": self.causal,
-                    "timestep": scaled_timestep if self.timestep_conditioning else None,
-                    "generator": generator,
-                }
-                sample = up_block(sample, **block_kwargs)
-            elif isinstance(up_block, ResnetBlock3D):
-                sample = up_block(sample, causal=self.causal, generator=generator)
-            else:
-                sample = up_block(sample, causal=self.causal)
-
-        sample = self.conv_norm_out(sample)
-
-        if self.timestep_conditioning:
-            embedded_timestep = self.last_time_embedder(
-                timestep=scaled_timestep.flatten(),
-                hidden_dtype=sample.dtype,
-            )
-            embedded_timestep = embedded_timestep.view(batch_size, embedded_timestep.shape[-1], 1, 1, 1)
-            ada_values = self.last_scale_shift_table[None, ..., None, None, None].to(
-                device=sample.device, dtype=sample.dtype
-            ) + embedded_timestep.reshape(
-                batch_size,
-                2,
-                -1,
-                embedded_timestep.shape[-3],
-                embedded_timestep.shape[-2],
-                embedded_timestep.shape[-1],
-            )
-            shift, scale = ada_values.unbind(dim=1)
-            sample = sample * (1 + scale) + shift
-
-        sample = self.conv_act(sample)
-        sample = self.conv_out(sample, causal=self.causal)
-
-        # Final spatial expansion: reverse the initial patchify from encoder
-        # Moves pixels from channels back to spatial dimensions
-        # Example: (B, 48, F, 128, 128) -> (B, 3, F, 512, 512) with patch_size=4
-        sample = unpatchify(sample, patch_size_hw=self.patch_size, patch_size_t=1)
-
-        return sample
-
-    def _prepare_tiles(
-        self,
-        latent: torch.Tensor,
-        tiling_config: TilingConfig | None = None,
-    ) -> List[Tile]:
-        splitters = [DEFAULT_SPLIT_OPERATION] * len(latent.shape)
-        mappers = [DEFAULT_MAPPING_OPERATION] * len(latent.shape)
-        if tiling_config is not None and tiling_config.spatial_config is not None:
-            cfg = tiling_config.spatial_config
-            long_side = max(latent.shape[3], latent.shape[4])
-
-            def enable_on_axis(axis_idx: int, factor: int) -> None:
-                size = cfg.tile_size_in_pixels // factor
-                overlap = cfg.tile_overlap_in_pixels // factor
-                axis_length = latent.shape[axis_idx]
-                lower_threshold = max(2, overlap + 1)
-                tile_size = max(lower_threshold, round(size * axis_length / long_side))
-                splitters[axis_idx] = split_in_spatial(tile_size, overlap)
-                mappers[axis_idx] = to_mapping_operation(map_spatial_slice, factor)
-
-            enable_on_axis(3, self.video_downscale_factors.height)
-            enable_on_axis(4, self.video_downscale_factors.width)
-
-        if tiling_config is not None and tiling_config.temporal_config is not None:
-            cfg = tiling_config.temporal_config
-            tile_size = cfg.tile_size_in_frames // self.video_downscale_factors.time
-            overlap = cfg.tile_overlap_in_frames // self.video_downscale_factors.time
-            splitters[2] = split_in_temporal(tile_size, overlap)
-            mappers[2] = to_mapping_operation(map_temporal_slice, self.video_downscale_factors.time)
-
-        return create_tiles(latent.shape, splitters, mappers)
-
-    def tiled_decode(
-        self,
-        latent: torch.Tensor,
-        tiling_config: TilingConfig | None = None,
-        timestep: torch.Tensor | None = None,
-        generator: torch.Generator | None = None,
-    ) -> Iterator[torch.Tensor]:
-        """
-        Decode a latent tensor into video frames using tiled processing.
-        Splits the latent tensor into tiles, decodes each tile individually,
-        and yields video chunks as they become available.
-        Args:
-            latent: Input latent tensor (B, C, F', H', W').
-            tiling_config: Tiling configuration for the latent tensor.
-            timestep: Optional timestep for decoder conditioning.
-            generator: Optional random generator for deterministic decoding.
-        Yields:
-            Video chunks (B, C, T, H, W) by temporal slices;
-        """
-
-        # Calculate full video shape from latent shape to get spatial dimensions
-        full_video_shape = VideoLatentShape.from_torch_shape(latent.shape).upscale(self.video_downscale_factors)
-        tiles = self._prepare_tiles(latent, tiling_config)
-
-        temporal_groups = self._group_tiles_by_temporal_slice(tiles)
-
-        # State for temporal overlap handling
-        previous_chunk = None
-        previous_weights = None
-        previous_temporal_slice = None
-
-        for temporal_group_tiles in temporal_groups:
-            curr_temporal_slice = temporal_group_tiles[0].out_coords[2]
-
-            # Calculate the shape of the temporal buffer for this group of tiles.
-            # The temporal length depends on whether this is the first tile (starts at 0) or not.
-            # - First tile: (frames - 1) * scale + 1
-            # - Subsequent tiles: frames * scale
-            # This logic is handled by TemporalAxisMapping and reflected in out_coords.
-            temporal_tile_buffer_shape = full_video_shape._replace(
-                frames=curr_temporal_slice.stop - curr_temporal_slice.start,
-            )
-
-            buffer = torch.zeros(
-                temporal_tile_buffer_shape.to_torch_shape(),
-                device=latent.device,
-                dtype=latent.dtype,
-            )
-
-            curr_weights = self._accumulate_temporal_group_into_buffer(
-                group_tiles=temporal_group_tiles,
-                buffer=buffer,
-                latent=latent,
-                timestep=timestep,
-                generator=generator,
-            )
-
-            # Blend with previous temporal chunk if it exists
-            if previous_chunk is not None:
-                # Check if current temporal slice overlaps with previous temporal slice
-                if previous_temporal_slice.stop > curr_temporal_slice.start:
-                    overlap_len = previous_temporal_slice.stop - curr_temporal_slice.start
-                    temporal_overlap_slice = slice(curr_temporal_slice.start - previous_temporal_slice.start, None)
-
-                    # The overlap is already masked before it reaches this step. Each tile is accumulated into buffer
-                    # with its trapezoidal mask, and curr_weights accumulates the same mask. In the overlap blend we add
-                    # the masked values (buffer[...]) and the corresponding weights (curr_weights[...]) into the
-                    # previous buffers, then later normalize by weights.
-                    previous_chunk[:, :, temporal_overlap_slice, :, :] += buffer[:, :, slice(0, overlap_len), :, :]
-                    previous_weights[:, :, temporal_overlap_slice, :, :] += curr_weights[
-                        :, :, slice(0, overlap_len), :, :
-                    ]
-
-                    buffer[:, :, slice(0, overlap_len), :, :] = previous_chunk[:, :, temporal_overlap_slice, :, :]
-                    curr_weights[:, :, slice(0, overlap_len), :, :] = previous_weights[
-                        :, :, temporal_overlap_slice, :, :
-                    ]
-
-                # Yield the non-overlapping part of the previous chunk
-                previous_weights = previous_weights.clamp(min=1e-8)
-                yield_len = curr_temporal_slice.start - previous_temporal_slice.start
-                yield (previous_chunk / previous_weights)[:, :, :yield_len, :, :]
-
-            # Update state for next iteration
-            previous_chunk = buffer
-            previous_weights = curr_weights
-            previous_temporal_slice = curr_temporal_slice
-
-        # Yield any remaining chunk
-        if previous_chunk is not None:
-            previous_weights = previous_weights.clamp(min=1e-8)
-            yield previous_chunk / previous_weights
-
-    def _group_tiles_by_temporal_slice(self, tiles: List[Tile]) -> List[List[Tile]]:
-        """Group tiles by their temporal output slice."""
-        if not tiles:
-            return []
-
-        groups = []
-        current_slice = tiles[0].out_coords[2]
-        current_group = []
-
+        # Process each tile
         for tile in tiles:
-            tile_slice = tile.out_coords[2]
-            if tile_slice == current_slice:
-                current_group.append(tile)
-            else:
-                groups.append(current_group)
-                current_slice = tile_slice
-                current_group = [tile]
+            # Extract video tile from input (may be on CPU)
+            video_tile = video[tile.in_coords]
 
-        # Add the final group
-        if current_group:
-            groups.append(current_group)
+            # Move tile to model device if needed
+            if video_tile.device != model_device or video_tile.dtype != model_dtype:
+                video_tile = video_tile.to(device=model_device, dtype=model_dtype)
 
-        return groups
+            # Encode tile to latent (output on model device)
+            latent_tile = self.forward(video_tile)
 
-    def _accumulate_temporal_group_into_buffer(
-        self,
-        group_tiles: List[Tile],
-        buffer: torch.Tensor,
-        latent: torch.Tensor,
-        timestep: torch.Tensor | None,
-        generator: torch.Generator | None,
-    ) -> torch.Tensor:
-        """
-        Decode and accumulate all tiles of a temporal group into a local buffer.
-        The buffer is local to the group and always starts at time 0; temporal coordinates
-        are rebased by subtracting temporal_slice.start.
-        """
-        temporal_slice = group_tiles[0].out_coords[2]
+            masks = tuple(m.to(device=model_device, dtype=torch.float32) for m in tile.masks_1d)
+            latent_buffer[tile.out_coords] += scale_by_masks_1d(latent_tile, masks)
+            if weights_buffer is not None:
+                strength = torch.ones(latent_tile.shape, device=model_device, dtype=torch.float32)
+                weights_buffer[tile.out_coords] += scale_by_masks_1d(strength, masks)
 
-        weights = torch.zeros_like(buffer)
+            del latent_tile, video_tile
 
-        for tile in group_tiles:
-            decoded_tile = self.forward(latent[tile.in_coords], timestep, generator)
-            mask = tile.blend_mask.to(device=buffer.device, dtype=buffer.dtype)
-            temporal_offset = tile.out_coords[2].start - temporal_slice.start
-            # Use the tile's output coordinate length, not the decoded tile's length,
-            # as the decoder may produce a different number of frames than expected
-            expected_temporal_len = tile.out_coords[2].stop - tile.out_coords[2].start
-            decoded_temporal_len = decoded_tile.shape[2]
-
-            # Ensure we don't exceed the buffer or decoded tile bounds
-            actual_temporal_len = min(expected_temporal_len, decoded_temporal_len, buffer.shape[2] - temporal_offset)
-
-            chunk_coords = (
-                slice(None),  # batch
-                slice(None),  # channels
-                slice(temporal_offset, temporal_offset + actual_temporal_len),
-                tile.out_coords[3],  # height
-                tile.out_coords[4],  # width
-            )
-
-            # Slice decoded_tile and mask to match the actual length we're writing
-            decoded_slice = decoded_tile[:, :, :actual_temporal_len, :, :]
-            mask_slice = mask[:, :, :actual_temporal_len, :, :] if mask.shape[2] > 1 else mask
-
-            buffer[chunk_coords] += decoded_slice * mask_slice
-            weights[chunk_coords] += mask_slice
-
-        return weights
+        if weights_buffer is None:
+            return latent_buffer
+        weights_buffer = weights_buffer.clamp(min=1e-8)
+        return latent_buffer / weights_buffer
 
 
-def decode_video(
-    latent: torch.Tensor,
-    video_decoder: VideoDecoder,
+def prepare_tiles_for_encoding(
+    video: torch.Tensor,
     tiling_config: TilingConfig | None = None,
-    generator: torch.Generator | None = None,
-) -> Iterator[torch.Tensor]:
-    """
-    Decode a video latent tensor with the given decoder.
+    scale_factors: SpatioTemporalScaleFactors = VIDEO_SCALE_FACTORS,
+) -> List[Tile]:
+    """Prepare tiles for VAE encoding.
+    Splits on the latent grid via ``tiling_config.to_splitters``, maps each
+    interval to pixel ``in_coords`` (encode-specific) and latent ``out_coords``,
+    and builds :class:`~ltx_core.tiling.Tile` values. Size- and count-based
+    configs share this path.
     Args:
-        latent: Tensor [c, f, h, w]
-        video_decoder: Decoder module.
-        tiling_config: Optional tiling settings.
-        generator: Optional random generator for deterministic decoding.
-    Yields:
-        Decoded chunk [f, h, w, c], uint8 in [0, 255].
+        video: Input video tensor (B, 3, F, H, W) in range [-1, 1]
+        tiling_config: Size- or count-based tiling configuration
+    Returns:
+        List of tiles for the video tensor
+    """
+    if tiling_config is None:
+        return create_tiles(
+            video.shape,
+            [DEFAULT_SPLIT_OPERATION] * len(video.shape),
+            [DEFAULT_MAPPING_OPERATION] * len(video.shape),
+        )
+
+    # Conv-VAE encode needs enough overlap to discard symmetric-pad edge artifacts.
+    _validate_overlap(tiling_config, min_overlap_frames=16, min_overlap_pixels=64)
+    _, _, frames, height, width = video.shape
+    latent_frames = (frames - 1) // scale_factors.time + 1
+    latent_height = height // scale_factors.height
+    latent_width = width // scale_factors.width
+    t_split, h_split, w_split = tiling_config.to_splitters(scale_factors, causal_temporal=True)
+    t_intervals = t_split(latent_frames).intervals
+    h_intervals = h_split(latent_height).intervals
+    w_intervals = w_split(latent_width).intervals
+
+    tiles: List[Tile] = []
+    for t_iv, h_iv, w_iv in itertools.product(t_intervals, h_intervals, w_intervals):
+        t_in, _ = map_temporal_slice(t_iv.start, t_iv.end, t_iv.left_ramp, t_iv.right_ramp, scale_factors.time)
+        h_in, _ = map_spatial_slice(h_iv.start, h_iv.end, h_iv.left_ramp, h_iv.right_ramp, scale_factors.height)
+        w_in, _ = map_spatial_slice(w_iv.start, w_iv.end, w_iv.left_ramp, w_iv.right_ramp, scale_factors.width)
+        tiles.append(
+            Tile(
+                in_coords=(slice(None), slice(None), t_in, h_in, w_in),
+                out_coords=(
+                    slice(None),
+                    slice(None),
+                    slice(t_iv.start, t_iv.end),
+                    slice(h_iv.start, h_iv.end),
+                    slice(w_iv.start, w_iv.end),
+                ),
+                masks_1d=(
+                    untiled_mask_1d(),
+                    untiled_mask_1d(),
+                    compute_trapezoidal_mask_1d(t_iv.end - t_iv.start, t_iv.left_ramp, t_iv.right_ramp, True),
+                    compute_trapezoidal_mask_1d(h_iv.end - h_iv.start, h_iv.left_ramp, h_iv.right_ramp, False),
+                    compute_trapezoidal_mask_1d(w_iv.end - w_iv.start, w_iv.left_ramp, w_iv.right_ramp, False),
+                ),
+            )
+        )
+    return tiles
+
+
+def _clip_generators(
+    count: int,
+    generator: torch.Generator | Sequence[torch.Generator | None] | None,
+) -> Sequence[torch.Generator | None]:
+    if generator is None:
+        return (None,) * count
+    if isinstance(generator, torch.Generator):
+        return (generator,) * count
+    if len(generator) != count:
+        raise ValueError(f"decode_single_frames got {count} latents and {len(generator)} generators")
+    return generator
+
+
+def iter_decoded_single_frames(
+    decoder: "VideoDecoder",
+    latents: Sequence[torch.Tensor],
+    generator: torch.Generator | Sequence[torch.Generator | None] | None = None,
+) -> Iterator[torch.Tensor]:
+    """Decode each latent through ``decode_video`` as its own clip.
+    Dist must pass the inner SGPU decoder, not itself: ``decode_video`` on Dist splits the
+    volume and workers return an empty iterator.
+    """
+    gens = _clip_generators(len(latents), generator)
+    for index, (latent, gen) in enumerate(zip(latents, gens, strict=True)):
+        if latent.ndim != 5 or latent.shape[2] != 1:
+            raise ValueError(
+                f"decode_single_frames expects (B, C, 1, H, W) latents, got {tuple(latent.shape)} at index {index}"
+            )
+        chunks = list(decoder.decode_video(latent, tiling_config=None, generator=gen))
+        if not chunks:
+            raise RuntimeError(f"Decoder returned no pixels for single-frame latent {index}")
+        yield torch.cat(chunks, dim=0)
+
+
+class VideoDecoder(Protocol):
+    """Structural interface for video VAE decoders.
+    Implementations decode a latent tensor into pixel-space video chunks
+    (e.g. ``ConvVideoDecoder``, ``DiffusionVideoDecoder``,
+    ``DistributedVideoDecoder``).
     """
 
-    def convert_to_uint8(frames: torch.Tensor) -> torch.Tensor:
-        frames = (((frames + 1.0) / 2.0).clamp(0.0, 1.0) * 255.0).to(torch.uint8)
-        frames = rearrange(frames[0], "c f h w -> f h w c")
-        return frames
+    video_downscale_factors: SpatioTemporalScaleFactors
 
-    if tiling_config is not None:
-        for frames in video_decoder.tiled_decode(latent, tiling_config, generator=generator):
-            yield convert_to_uint8(frames)
-    else:
-        decoded_video = video_decoder(latent, generator=generator)
-        yield convert_to_uint8(decoded_video)
+    def decode_video(
+        self,
+        latent: torch.Tensor,
+        tiling_config: TileSizeConfig | TileCountConfig | None = None,
+        generator: torch.Generator | None = None,
+        *,
+        keyframes: "DecodeKeyframes | None" = None,
+    ) -> Iterator[torch.Tensor]:
+        """Decode a video latent tensor, yielding float chunks ``[f, h, w, c]`` in ``[0, 1]``.
+        ``keyframes`` anchors the decode on already-encoded single-frame planes. It is a hint,
+        not a contract: a decoder that cannot use it says so once and decodes plainly, so a
+        caller never has to ask which decoder it got before handing keyframes over.
+        """
+        ...
+
+    def decode_single_frames(
+        self,
+        latents: Sequence[torch.Tensor],
+        generator: torch.Generator | Sequence[torch.Generator | None] | None = None,
+    ) -> Iterator[torch.Tensor]:
+        """Decode each latent as its own one-frame clip, yielding one RGB tensor per latent.
+        A causal VAE cannot decode stacked independent planes without bleeding neighbours.
+        Dist implementations decode locally on every rank; they do not split or gather.
+        """
+        ...
 
 
-def get_video_chunks_number(num_frames: int, tiling_config: TilingConfig | None = None) -> int:
+def get_video_chunks_number(
+    num_frames: int,
+    tiling_config: TileSizeConfig | TileCountConfig | None = None,
+) -> int:
     """
     Get the number of video chunks for a given number of frames and tiling configuration.
+    Delegates to :meth:`TileSizeConfig.video_chunks_number` /
+    :meth:`TileCountConfig.video_chunks_number`.
     Args:
         num_frames: Number of frames in the video.
         tiling_config: Tiling configuration.
     Returns:
         Number of video chunks.
     """
-    if not tiling_config or not tiling_config.temporal_config:
+    if tiling_config is None:
         return 1
-    cfg = tiling_config.temporal_config
-    frame_stride = cfg.tile_size_in_frames - cfg.tile_overlap_in_frames
-    return (num_frames - 1 + frame_stride - 1) // frame_stride
-
-
-def split_in_spatial(size: int, overlap: int) -> SplitOperation:
-    def split(dimension_size: int) -> DimensionIntervals:
-        if dimension_size <= size:
-            return DEFAULT_SPLIT_OPERATION(dimension_size)
-        amount = (dimension_size + size - 2 * overlap - 1) // (size - overlap)
-        starts = [i * (size - overlap) for i in range(amount)]
-        ends = [start + size for start in starts]
-        ends[-1] = dimension_size
-        left_ramps = [0] + [overlap] * (amount - 1)
-        right_ramps = [overlap] * (amount - 1) + [0]
-        return DimensionIntervals(starts=starts, ends=ends, left_ramps=left_ramps, right_ramps=right_ramps)
-
-    return split
-
-
-def split_in_temporal(size: int, overlap: int) -> SplitOperation:
-    non_causal_split = split_in_spatial(size, overlap)
-
-    def split(dimension_size: int) -> DimensionIntervals:
-        if dimension_size <= size:
-            return DEFAULT_SPLIT_OPERATION(dimension_size)
-        intervals = non_causal_split(dimension_size)
-        starts = intervals.starts
-        starts[1:] = [s - 1 for s in starts[1:]]
-        left_ramps = intervals.left_ramps
-        left_ramps[1:] = [r + 1 for r in left_ramps[1:]]
-        return replace(intervals, starts=starts, left_ramps=left_ramps)
-
-    return split
+    return tiling_config.video_chunks_number(num_frames)
 
 
 def to_mapping_operation(
     map_func: Callable[[int, int, int, int, int], Tuple[slice, torch.Tensor]],
     scale: int,
 ) -> MappingOperation:
-    def map_op(intervals: DimensionIntervals) -> tuple[list[slice], list[torch.Tensor | None]]:
+    """Create a mapping operation over a set of tiling intervals.
+    The given mapping function is applied to each interval in the input dimension. The result function is used for
+    creating tiles in the output dimension.
+    Args:
+        map_func: Mapping function to create the mapping operation from
+        scale: Scale factor for the transformation, used as an argument for the mapping function
+    Returns:
+        Mapping operation that takes a set of tiling intervals and returns a set of slices and masks in the output
+        dimension.
+    """
+
+    def map_op(intervals: DimensionIntervals) -> tuple[list[slice], list[torch.Tensor]]:
         output_slices: list[slice] = []
-        masks_1d: list[torch.Tensor | None] = []
-        number_of_slices = len(intervals.starts)
-        for i in range(number_of_slices):
-            start = intervals.starts[i]
-            end = intervals.ends[i]
-            left_ramp = intervals.left_ramps[i]
-            right_ramp = intervals.right_ramps[i]
-            output_slice, mask_1d = map_func(start, end, left_ramp, right_ramp, scale)
+        masks_1d: list[torch.Tensor] = []
+        for interval in intervals.intervals:
+            output_slice, mask_1d = map_func(
+                interval.start, interval.end, interval.left_ramp, interval.right_ramp, scale
+            )
             output_slices.append(output_slice)
             masks_1d.append(mask_1d)
         return output_slices, masks_1d
@@ -911,10 +602,38 @@ def to_mapping_operation(
 def map_temporal_slice(begin: int, end: int, left_ramp: int, right_ramp: int, scale: int) -> Tuple[slice, torch.Tensor]:
     start = begin * scale
     stop = 1 + (end - 1) * scale
-    left_ramp = 1 + (left_ramp - 1) * scale
+    left_ramp = 0 if left_ramp == 0 else 1 + (left_ramp - 1) * scale
     right_ramp = right_ramp * scale
 
     return slice(start, stop), compute_trapezoidal_mask_1d(stop - start, left_ramp, right_ramp, True)
+
+
+def map_temporal_interval_to_latent(
+    begin: int, end: int, left_ramp: int, right_ramp: int | None = None, scale: int = 1
+) -> Tuple[slice, torch.Tensor]:
+    """
+    Map temporal interval in video frame space to latent space.
+    Args:
+        begin: Start position in video frame space
+        end: End position in video frame space
+        left_ramp: Left ramp size in video frame space
+        right_ramp: Right ramp size in video frame space
+        scale: Scale factor for transformation
+    Returns:
+        Tuple of (output_slice, blend_mask)
+    """
+    start = begin // scale
+    stop = (end - 1) // scale + 1
+
+    left_ramp_latents = 0 if left_ramp == 0 else 1 + (left_ramp - 1) // scale
+    right_ramp_latents = right_ramp // scale
+
+    if right_ramp_latents != 0:
+        raise ValueError("For tiled encoding, temporal tiles are expected to have a right ramp equal to 0")
+
+    mask_1d = compute_rectangular_mask_1d(stop - start, left_ramp_latents, right_ramp_latents)
+
+    return slice(start, stop), mask_1d
 
 
 def map_spatial_slice(begin: int, end: int, left_ramp: int, right_ramp: int, scale: int) -> Tuple[slice, torch.Tensor]:
@@ -924,3 +643,48 @@ def map_spatial_slice(begin: int, end: int, left_ramp: int, right_ramp: int, sca
     right_ramp = right_ramp * scale
 
     return slice(start, stop), compute_trapezoidal_mask_1d(stop - start, left_ramp, right_ramp, False)
+
+
+def map_spatial_interval_to_latent(
+    begin: int,
+    end: int,
+    left_ramp: int,
+    right_ramp: int,
+    scale: int,
+) -> Tuple[slice, torch.Tensor]:
+    """Map spatial interval in pixel space to latent space.
+       Args:
+        begin: Start position in pixel space
+        end: End position in pixel space
+        left_ramp: Left ramp size in pixel space
+        right_ramp: Right ramp size in pixel space
+        scale: Scale factor for transformation
+    Returns:
+        Tuple of (output_slice, blend_mask)
+    """
+    start = begin // scale
+    stop = end // scale
+    left_ramp = max(0, left_ramp // scale - 1)
+
+    right_ramp = 0 if right_ramp == 0 else 1
+
+    mask_1d = compute_rectangular_mask_1d(stop - start, left_ramp, right_ramp)
+    return slice(start, stop), mask_1d
+
+
+from ltx_core.model.video_vae.conv_video_decoder import ConvVideoDecoder  # noqa: E402
+from ltx_core.model.video_vae.diffusion_video_decoder import DiffusionVideoDecoder  # noqa: E402
+
+__all__ = [
+    "ConvVideoDecoder",
+    "DiffusionVideoDecoder",
+    "VideoDecoder",
+    "VideoEncoder",
+    "get_video_chunks_number",
+    "map_spatial_interval_to_latent",
+    "map_spatial_slice",
+    "map_temporal_interval_to_latent",
+    "map_temporal_slice",
+    "prepare_tiles_for_encoding",
+    "to_mapping_operation",
+]

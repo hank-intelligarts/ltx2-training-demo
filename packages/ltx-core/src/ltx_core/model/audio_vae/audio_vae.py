@@ -8,12 +8,13 @@ from ltx_core.model.audio_vae.attention import AttentionType, make_attn
 from ltx_core.model.audio_vae.causal_conv_2d import make_conv2d
 from ltx_core.model.audio_vae.causality_axis import CausalityAxis
 from ltx_core.model.audio_vae.downsample import build_downsampling_path
-from ltx_core.model.audio_vae.ops import PerChannelStatistics
+from ltx_core.model.audio_vae.ops import AudioProcessor, PerChannelStatistics
 from ltx_core.model.audio_vae.resnet import ResnetBlock
 from ltx_core.model.audio_vae.upsample import build_upsampling_path
 from ltx_core.model.audio_vae.vocoder import Vocoder
 from ltx_core.model.common.normalization import NormType, build_normalization_layer
-from ltx_core.types import AudioLatentShape
+from ltx_core.model.disposable import Disposable
+from ltx_core.types import Audio, AudioLatentShape
 
 LATENT_DOWNSAMPLE_FACTOR = 4
 
@@ -56,7 +57,7 @@ def run_mid_block(mid: torch.nn.Module, features: torch.Tensor) -> torch.Tensor:
     return mid.block_2(features, temb=None)
 
 
-class AudioEncoder(torch.nn.Module):
+class AudioEncoder(torch.nn.Module, Disposable):
     """
     Encoder that compresses audio spectrograms into latent representations.
     The encoder uses a series of downsampling blocks with residual connections,
@@ -245,7 +246,35 @@ class AudioEncoder(torch.nn.Module):
         return self.patchifier.unpatchify(latent_normalized, latent_shape)
 
 
-class AudioDecoder(torch.nn.Module):
+def encode_audio(
+    audio: Audio,
+    audio_encoder: AudioEncoder,
+    audio_processor: AudioProcessor | None = None,
+) -> torch.Tensor:
+    """Encode audio waveform into latent representation.
+    Args:
+        audio: Audio container with waveform tensor of shape (batch, channels, samples) and sampling rate.
+        audio_encoder: Audio encoder model
+        audio_processor: Audio processor model (optional, if not provided, it will be created from the audio encoder)
+    """
+    dtype = next(audio_encoder.parameters()).dtype
+    device = next(audio_encoder.parameters()).device
+
+    if audio_processor is None:
+        audio_processor = AudioProcessor(
+            target_sample_rate=audio_encoder.sample_rate,
+            mel_bins=audio_encoder.mel_bins,
+            mel_hop_length=audio_encoder.mel_hop_length,
+            n_fft=audio_encoder.n_fft,
+        ).to(device=device)
+
+    mel_spectrogram = audio_processor.waveform_to_mel(audio.to(device=device))
+
+    latent = audio_encoder(mel_spectrogram.to(dtype=dtype))
+    return latent
+
+
+class AudioDecoder(torch.nn.Module, Disposable):
     """
     Symmetric decoder that reconstructs audio spectrograms from latent features.
     The decoder mirrors the encoder structure with configurable channel multipliers,
@@ -465,7 +494,7 @@ class AudioDecoder(torch.nn.Module):
         return torch.tanh(h) if self.tanh_out else h
 
 
-def decode_audio(latent: torch.Tensor, audio_decoder: "AudioDecoder", vocoder: "Vocoder") -> torch.Tensor:
+def decode_audio(latent: torch.Tensor, audio_decoder: "AudioDecoder", vocoder: "Vocoder") -> Audio:
     """
     Decode an audio latent representation using the provided audio decoder and vocoder.
     Args:
@@ -473,8 +502,8 @@ def decode_audio(latent: torch.Tensor, audio_decoder: "AudioDecoder", vocoder: "
         audio_decoder: Model to decode the latent to waveform features.
         vocoder: Model to convert decoded features to audio waveform.
     Returns:
-        Decoded audio as a float tensor.
+        Decoded audio with waveform and sampling rate.
     """
     decoded_audio = audio_decoder(latent)
-    decoded_audio = vocoder(decoded_audio).squeeze(0).float()
-    return decoded_audio
+    waveform = vocoder(decoded_audio).squeeze(0).float()
+    return Audio(waveform=waveform, sampling_rate=vocoder.output_sampling_rate)

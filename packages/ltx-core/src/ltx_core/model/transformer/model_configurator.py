@@ -1,12 +1,11 @@
 import torch
 
-from ltx_core.loader.fuse_loras import fused_add_round_launch
-from ltx_core.loader.module_ops import ModuleOps
-from ltx_core.loader.sd_ops import KeyValueOperationResult, SDOps
+from ltx_core.loader.sd_ops import SDOps
 from ltx_core.model.model_protocol import ModelConfigurator
-from ltx_core.model.transformer.attention import AttentionFunction
 from ltx_core.model.transformer.model import LTXModel, LTXModelType
 from ltx_core.model.transformer.rope import LTXRopeType
+from ltx_core.model.transformer.text_projection import create_caption_projection
+from ltx_core.model.transformer.transformer import DEFAULT_TRANSFORMER_OPS, TransformerOpsConfig
 from ltx_core.utils import check_config_value
 
 
@@ -17,7 +16,11 @@ class LTXModelConfigurator(ModelConfigurator[LTXModel]):
     """
 
     @classmethod
-    def from_config(cls: type[LTXModel], config: dict) -> LTXModel:
+    def from_metadata(cls, metadata: dict, ops: TransformerOpsConfig = DEFAULT_TRANSFORMER_OPS) -> LTXModel:
+        config = metadata.get("config", {})
+        # Build caption projections for 19B models (projection handled in transformer).
+        caption_projection, audio_caption_projection = _build_caption_projections(config, is_av=True)
+
         config = config.get("transformer", {})
 
         check_config_value(config, "dropout", 0.0)
@@ -38,6 +41,7 @@ class LTXModelConfigurator(ModelConfigurator[LTXModel]):
         check_config_value(config, "share_ff", False)
         check_config_value(config, "av_cross_ada_norm", True)
         check_config_value(config, "use_middle_indices_grid", True)
+        check_config_value(config, "num_attention_heads", config.get("audio_num_attention_heads", float("nan")))
 
         return LTXModel(
             model_type=LTXModelType.AudioVideo,
@@ -48,8 +52,7 @@ class LTXModelConfigurator(ModelConfigurator[LTXModel]):
             num_layers=config.get("num_layers", 48),
             cross_attention_dim=config.get("cross_attention_dim", 4096),
             norm_eps=config.get("norm_eps", 1e-06),
-            attention_type=AttentionFunction(config.get("attention_type", "default")),
-            caption_channels=config.get("caption_channels", 3840),
+            ops=ops,
             positional_embedding_theta=config.get("positional_embedding_theta", 10000.0),
             positional_embedding_max_pos=config.get("positional_embedding_max_pos", [20, 2048, 2048]),
             timestep_scale_multiplier=config.get("timestep_scale_multiplier", 1000),
@@ -61,8 +64,22 @@ class LTXModelConfigurator(ModelConfigurator[LTXModel]):
             audio_cross_attention_dim=config.get("audio_cross_attention_dim", 2048),
             audio_positional_embedding_max_pos=config.get("audio_positional_embedding_max_pos", [20]),
             av_ca_timestep_scale_multiplier=config.get("av_ca_timestep_scale_multiplier", 1),
-            rope_type=LTXRopeType(config.get("rope_type", "interleaved")),
+            rope_type=LTXRopeType(config.get("rope_type", "split")),
             double_precision_rope=config.get("frequencies_precision", False) == "float64",
+            apply_gated_attention=config.get("apply_gated_attention", False),
+            caption_projection=caption_projection,
+            audio_caption_projection=audio_caption_projection,
+            cross_attention_adaln=config.get("cross_attention_adaln", False),
+            # Default True preserves the prompt-side AdaLN MLP for existing checkpoints. KV-cacheable
+            # checkpoints set use_prompt_adaln_single=false, dropping the timestep-dependence of the
+            # cross-attention K/V so they can be computed once per prompt and reused across steps.
+            use_prompt_adaln_single=config.get("use_prompt_adaln_single", True),
+            # Default True keeps backwards compatibility: pre-2.5 checkpoints lack these
+            # keys and retain FFN biases. LTX 2.5 (gemma4) sets ff_bias=false.
+            ff_bias=config.get("ff_bias", True),
+            audio_ff_bias=config.get("audio_ff_bias", True),
+            # Only generated-keyframe checkpoints set this; defaults off so older ones are untouched.
+            use_keyframes_abs_pos_embedding=config.get("use_keyframes_abs_pos_embedding", False),
         )
 
 
@@ -73,7 +90,11 @@ class LTXVideoOnlyModelConfigurator(ModelConfigurator[LTXModel]):
     """
 
     @classmethod
-    def from_config(cls: type[LTXModel], config: dict) -> LTXModel:
+    def from_metadata(cls, metadata: dict, ops: TransformerOpsConfig = DEFAULT_TRANSFORMER_OPS) -> LTXModel:
+        config = metadata.get("config", {})
+        # Build caption projection for 19B model (projection handled in transformer).
+        caption_projection, _ = _build_caption_projections(config, is_av=False)
+
         config = config.get("transformer", {})
 
         check_config_value(config, "dropout", 0.0)
@@ -101,70 +122,101 @@ class LTXVideoOnlyModelConfigurator(ModelConfigurator[LTXModel]):
             num_layers=config.get("num_layers", 48),
             cross_attention_dim=config.get("cross_attention_dim", 4096),
             norm_eps=config.get("norm_eps", 1e-06),
-            attention_type=AttentionFunction(config.get("attention_type", "default")),
-            caption_channels=config.get("caption_channels", 3840),
+            ops=ops,
             positional_embedding_theta=config.get("positional_embedding_theta", 10000.0),
             positional_embedding_max_pos=config.get("positional_embedding_max_pos", [20, 2048, 2048]),
             timestep_scale_multiplier=config.get("timestep_scale_multiplier", 1000),
             use_middle_indices_grid=config.get("use_middle_indices_grid", True),
-            rope_type=LTXRopeType(config.get("rope_type", "interleaved")),
+            rope_type=LTXRopeType(config.get("rope_type", "split")),
             double_precision_rope=config.get("frequencies_precision", False) == "float64",
+            apply_gated_attention=config.get("apply_gated_attention", False),
+            caption_projection=caption_projection,
+            cross_attention_adaln=config.get("cross_attention_adaln", False),
+            # Default True preserves the prompt-side AdaLN MLP for existing checkpoints. KV-cacheable
+            # checkpoints set use_prompt_adaln_single=false, making the cross-attention K/V
+            # timestep-independent (computed once per prompt, reused across steps).
+            use_prompt_adaln_single=config.get("use_prompt_adaln_single", True),
+            # Default True keeps backwards compatibility with pre-2.5 checkpoints.
+            ff_bias=config.get("ff_bias", True),
+            # Only generated-keyframe checkpoints set this; defaults off so older ones are untouched.
+            use_keyframes_abs_pos_embedding=config.get("use_keyframes_abs_pos_embedding", False),
         )
 
 
-def _naive_weight_or_bias_downcast(key: str, value: torch.Tensor) -> list[KeyValueOperationResult]:
+class LTXAudioOnlyModelConfigurator(ModelConfigurator[LTXModel]):
     """
-    Downcast the weight or bias to the float8_e4m3fn dtype.
-    """
-    return [KeyValueOperationResult(key, value.to(dtype=torch.float8_e4m3fn))]
-
-
-def _upcast_and_round(
-    weight: torch.Tensor, dtype: torch.dtype, with_stochastic_rounding: bool = False, seed: int = 0
-) -> torch.Tensor:
-    """
-    Upcast the weight to the given dtype and optionally apply stochastic rounding.
-    Input weight needs to have float8_e4m3fn or float8_e5m2 dtype.
-    """
-    if not with_stochastic_rounding:
-        return weight.to(dtype)
-    return fused_add_round_launch(torch.zeros_like(weight, dtype=dtype), weight, seed)
-
-
-def replace_fwd_with_upcast(layer: torch.nn.Linear, with_stochastic_rounding: bool = False, seed: int = 0) -> None:
-    """
-    Replace linear.forward and rms_norm.forward with a version that:
-      - upcasts weight and bias to input's dtype
-      - returns F.linear or F.rms_norm calculated in that dtype
+    Configurator for LTX audio only model.
+    Builds an audio-only LTX model (``model_type=AudioOnly``) so the video
+    transformer weights are never instantiated or loaded. Useful for
+    text-to-audio inference where the video branch is unused.
     """
 
-    layer.original_forward = layer.forward
+    @classmethod
+    def from_metadata(cls, metadata: dict, ops: TransformerOpsConfig = DEFAULT_TRANSFORMER_OPS) -> LTXModel:
+        config = metadata.get("config", {})
+        # Build audio caption projection for 19B models (projection handled in transformer).
+        _, audio_caption_projection = _build_caption_projections(config, is_av=True)
 
-    def new_linear_forward(*args, **_kwargs) -> torch.Tensor:
-        # assume first arg is the input tensor
-        x = args[0]
-        w_up = _upcast_and_round(layer.weight, x.dtype, with_stochastic_rounding, seed)
-        b_up = None
+        config = config.get("transformer", {})
 
-        if layer.bias is not None:
-            b_up = _upcast_and_round(layer.bias, x.dtype, with_stochastic_rounding, seed)
+        check_config_value(config, "dropout", 0.0)
+        check_config_value(config, "attention_bias", True)
+        check_config_value(config, "num_vector_embeds", None)
+        check_config_value(config, "activation_fn", "gelu-approximate")
+        check_config_value(config, "num_embeds_ada_norm", 1000)
+        check_config_value(config, "use_linear_projection", False)
+        check_config_value(config, "only_cross_attention", False)
+        check_config_value(config, "cross_attention_norm", True)
+        check_config_value(config, "double_self_attention", False)
+        check_config_value(config, "upcast_attention", False)
+        check_config_value(config, "standardization_norm", "rms_norm")
+        check_config_value(config, "norm_elementwise_affine", False)
+        check_config_value(config, "qk_norm", "rms_norm")
+        check_config_value(config, "positional_embedding_type", "rope")
+        check_config_value(config, "use_middle_indices_grid", True)
 
-        return torch.nn.functional.linear(x, w_up, b_up)
+        return LTXModel(
+            model_type=LTXModelType.AudioOnly,
+            num_layers=config.get("num_layers", 48),
+            norm_eps=config.get("norm_eps", 1e-06),
+            ops=ops,
+            timestep_scale_multiplier=config.get("timestep_scale_multiplier", 1000),
+            use_middle_indices_grid=config.get("use_middle_indices_grid", True),
+            audio_num_attention_heads=config.get("audio_num_attention_heads", 32),
+            audio_attention_head_dim=config.get("audio_attention_head_dim", 64),
+            audio_in_channels=config.get("audio_in_channels", 128),
+            audio_out_channels=config.get("audio_out_channels", 128),
+            audio_cross_attention_dim=config.get("audio_cross_attention_dim", 2048),
+            audio_positional_embedding_max_pos=config.get("audio_positional_embedding_max_pos", [20]),
+            rope_type=LTXRopeType(config.get("rope_type", "split")),
+            double_precision_rope=config.get("frequencies_precision", False) == "float64",
+            apply_gated_attention=config.get("apply_gated_attention", False),
+            audio_caption_projection=audio_caption_projection,
+            cross_attention_adaln=config.get("cross_attention_adaln", False),
+        )
 
-    layer.forward = new_linear_forward
 
-
-def amend_forward_with_upcast(
-    model: torch.nn.Module, with_stochastic_rounding: bool = False, seed: int = 0
-) -> torch.nn.Module:
+def _build_caption_projections(
+    config: dict,
+    is_av: bool,
+) -> tuple[torch.nn.Module | None, torch.nn.Module | None]:
+    """Build caption projections for the transformer when projection is NOT in the text encoder.
+    19B models: projection is in the transformer (caption_proj_before_connector=False).
+    22B models: projection is in the text encoder, so no projections are created here.
+    Args:
+        config: Full model config dict (must contain "transformer" key).
+        is_av: Whether this is an audio-video model. When False, audio projection is skipped.
+    Returns:
+        Tuple of (video_caption_projection, audio_caption_projection), both None for 22B models.
     """
-    Replace the forward method of the model's Linear and RMSNorm layers to forward
-    with upcast and optional stochastic rounding.
-    """
-    for m in model.modules():
-        if isinstance(m, (torch.nn.Linear)):
-            replace_fwd_with_upcast(m, with_stochastic_rounding, seed)
-    return model
+    transformer_config = config.get("transformer", {})
+    if transformer_config.get("caption_proj_before_connector", False):
+        return None, None
+
+    with torch.device("meta"):
+        caption_projection = create_caption_projection(transformer_config)
+        audio_caption_projection = create_caption_projection(transformer_config, audio=True) if is_av else None
+    return caption_projection, audio_caption_projection
 
 
 LTXV_MODEL_COMFY_RENAMING_MAP = (
@@ -173,65 +225,15 @@ LTXV_MODEL_COMFY_RENAMING_MAP = (
     .with_replacement("model.diffusion_model.", "")
 )
 
-LTXV_MODEL_COMFY_RENAMING_WITH_TRANSFORMER_LINEAR_DOWNCAST_MAP = (
-    SDOps("LTXV_MODEL_COMFY_PREFIX_MAP")
-    .with_matching(prefix="model.diffusion_model.")
+LTXV_AUDIO_ONLY_MODEL_COMFY_RENAMING_MAP = (
+    SDOps("LTXV_AUDIO_ONLY_MODEL_COMFY_MAP")
+    .with_matching(prefix="model.diffusion_model.", contains="audio_attn1")
+    .with_matching(prefix="model.diffusion_model.", contains="audio_attn2")
+    .with_matching(prefix="model.diffusion_model.", contains="audio_ff")
+    .with_matching(prefix="model.diffusion_model.", contains="audio_patchify")
+    .with_matching(prefix="model.diffusion_model.", contains="audio_proj_out")
+    .with_matching(prefix="model.diffusion_model.", contains="audio_adaln_single")
+    .with_matching(prefix="model.diffusion_model.", contains="audio_prompt")
+    .with_matching(prefix="model.diffusion_model.", contains="audio_scale_shift_table")
     .with_replacement("model.diffusion_model.", "")
-    .with_kv_operation(
-        key_prefix="transformer_blocks.", key_suffix=".to_q.weight", operation=_naive_weight_or_bias_downcast
-    )
-    .with_kv_operation(
-        key_prefix="transformer_blocks.", key_suffix=".to_q.bias", operation=_naive_weight_or_bias_downcast
-    )
-    .with_kv_operation(
-        key_prefix="transformer_blocks.", key_suffix=".to_k.weight", operation=_naive_weight_or_bias_downcast
-    )
-    .with_kv_operation(
-        key_prefix="transformer_blocks.", key_suffix=".to_k.bias", operation=_naive_weight_or_bias_downcast
-    )
-    .with_kv_operation(
-        key_prefix="transformer_blocks.", key_suffix=".to_v.weight", operation=_naive_weight_or_bias_downcast
-    )
-    .with_kv_operation(
-        key_prefix="transformer_blocks.", key_suffix=".to_v.bias", operation=_naive_weight_or_bias_downcast
-    )
-    .with_kv_operation(
-        key_prefix="transformer_blocks.", key_suffix=".to_out.0.weight", operation=_naive_weight_or_bias_downcast
-    )
-    .with_kv_operation(
-        key_prefix="transformer_blocks.", key_suffix=".to_out.0.bias", operation=_naive_weight_or_bias_downcast
-    )
-    .with_kv_operation(
-        key_prefix="transformer_blocks.", key_suffix=".ff.net.0.proj.weight", operation=_naive_weight_or_bias_downcast
-    )
-    .with_kv_operation(
-        key_prefix="transformer_blocks.", key_suffix=".ff.net.0.proj.bias", operation=_naive_weight_or_bias_downcast
-    )
-    .with_kv_operation(
-        key_prefix="transformer_blocks.", key_suffix=".ff.net.2.weight", operation=_naive_weight_or_bias_downcast
-    )
-    .with_kv_operation(
-        key_prefix="transformer_blocks.", key_suffix=".ff.net.2.bias", operation=_naive_weight_or_bias_downcast
-    )
 )
-
-UPCAST_DURING_INFERENCE = ModuleOps(
-    name="upcast_fp8_during_linear_forward",
-    matcher=lambda model: isinstance(model, LTXModel),
-    mutator=lambda model: amend_forward_with_upcast(model, False),
-)
-
-
-class UpcastWithStochasticRounding(ModuleOps):
-    """
-    ModuleOps for upcasting the model's float8_e4m3fn weights and biases to the bfloat16 dtype
-    and applying stochastic rounding during linear forward.
-    """
-
-    def __new__(cls, seed: int = 0):
-        return super().__new__(
-            cls,
-            name="upcast_fp8_during_linear_forward_with_stochastic_rounding",
-            matcher=lambda model: isinstance(model, LTXModel),
-            mutator=lambda model: amend_forward_with_upcast(model, True, seed),
-        )

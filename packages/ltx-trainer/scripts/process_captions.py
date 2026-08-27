@@ -8,17 +8,19 @@ This module provides functionality for processing text captions, including:
 - CaptionsDataset for caption-only preprocessing workflows
 Can be used as a standalone script:
     python scripts/process_captions.py dataset.json --output-dir /path/to/output \
-        --model-source /path/to/ltx2.safetensors --text-encoder-path /path/to/gemma
+        --model-path /path/to/ltx-checkpoint.safetensors --text-encoder-path /path/to/gemma-root
 """
 
 import json
 import os
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
 import pandas as pd
 import torch
 import typer
+from accelerate import PartialState
 from rich.console import Console
 from rich.progress import (
     BarColumn,
@@ -30,11 +32,11 @@ from rich.progress import (
     TimeElapsedColumn,
     TimeRemainingColumn,
 )
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader, Dataset, Subset
 from transformers.utils.logging import disable_progress_bar
 
 from ltx_trainer import logger
-from ltx_trainer.model_loader import load_text_encoder
+from ltx_trainer.model_loader import embedding_weight_paths, load_embeddings_processor, load_text_encoder
 
 # Disable tokenizers parallelism to avoid warnings
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
@@ -152,6 +154,17 @@ class CaptionsDataset(Dataset):
         else:
             raise ValueError("Expected `dataset_file` to be a path to a CSV, JSON, or JSONL file.")
 
+    def _embedding_output_path(self, media_path: Path) -> str:
+        """Output `.pt` path relative to the dataset dir; mirrors `process_videos._output_relative`
+        so caption keys match video/audio latent keys (and absolute paths don't escape output_dir)."""
+        data_root = self.dataset_file.parent
+        resolved = data_root / media_path  # pathlib: an absolute media_path overrides data_root
+        try:
+            rel = resolved.relative_to(data_root)
+        except ValueError:
+            rel = Path(*resolved.parts[1:]) if resolved.is_absolute() else resolved
+        return str(rel.with_suffix(".pt"))
+
     def _load_caption_data_from_csv(self) -> dict[str, str]:
         """Load captions from a CSV file and compute output embedding paths."""
         df = pd.read_csv(self.dataset_file)
@@ -164,8 +177,7 @@ class CaptionsDataset(Dataset):
         caption_data = {}
         for _, row in df.iterrows():
             media_path = Path(row[self.media_column].strip())
-            # Convert media path to embedding output path (same structure, .pt extension)
-            output_path = str(media_path.with_suffix(".pt"))
+            output_path = self._embedding_output_path(media_path)
             caption_data[output_path] = row[self.caption_column]
 
         return caption_data
@@ -186,8 +198,7 @@ class CaptionsDataset(Dataset):
                 raise ValueError(f"Key '{self.media_column}' not found in JSON entry: {entry}")
 
             media_path = Path(entry[self.media_column].strip())
-            # Convert media path to embedding output path (same structure, .pt extension)
-            output_path = str(media_path.with_suffix(".pt"))
+            output_path = self._embedding_output_path(media_path)
             caption_data[output_path] = entry[self.caption_column]
 
         return caption_data
@@ -204,8 +215,7 @@ class CaptionsDataset(Dataset):
                     raise ValueError(f"Key '{self.media_column}' not found in JSONL entry: {entry}")
 
                 media_path = Path(entry[self.media_column].strip())
-                # Convert media path to embedding output path (same structure, .pt extension)
-                output_path = str(media_path.with_suffix(".pt"))
+                output_path = self._embedding_output_path(media_path)
                 caption_data[output_path] = entry[self.caption_column]
 
         return caption_data
@@ -232,9 +242,14 @@ def compute_captions_embeddings(  # noqa: PLR0913
     batch_size: int = 8,
     device: str = "cuda",
     load_in_8bit: bool = False,
+    overwrite: bool = False,
 ) -> None:
     """
     Process captions and save text embeddings.
+    Under ``accelerate launch``, each process handles an interleaved shard of
+    the dataset (rank/world read from ``accelerate.PartialState``). Already-
+    computed ``.pt`` outputs are skipped unless ``overwrite=True``; writes are
+    atomic so an interrupted run is safe to resume.
     Args:
         dataset_file: Path to metadata file (CSV/JSON/JSONL) containing captions and media paths
         output_dir: Directory to save embeddings
@@ -247,11 +262,12 @@ def compute_captions_embeddings(  # noqa: PLR0913
         batch_size: Batch size for processing
         device: Device to use for computation
         load_in_8bit: Whether to load the Gemma text encoder in 8-bit precision
+        overwrite: Re-encode every item even if its output exists. Use when rerunning with
+            changed parameters (different text encoder, lora_trigger, etc.) so stale
+            outputs are replaced.
     """
-
     console = Console()
 
-    # Create dataset
     dataset = CaptionsDataset(
         dataset_file=dataset_file,
         caption_column=caption_column,
@@ -264,19 +280,6 @@ def compute_captions_embeddings(  # noqa: PLR0913
     output_path = Path(output_dir)
     output_path.mkdir(parents=True, exist_ok=True)
 
-    # Load text encoder
-    with console.status("[bold]Loading Gemma text encoder...", spinner="dots"):
-        text_encoder = load_text_encoder(
-            model_path,
-            text_encoder_path,
-            device=device,
-            dtype=torch.bfloat16,
-            load_in_8bit=load_in_8bit,
-            with_audio=False,
-        )
-
-    logger.info("Text encoder loaded successfully")
-
     # TODO(batch-tokenization): The current Gemma tokenizer doesn't support batched tokenization.
     if batch_size > 1:
         logger.warning(
@@ -285,12 +288,33 @@ def compute_captions_embeddings(  # noqa: PLR0913
         )
         batch_size = 1
 
-    # Create dataloader
-    dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=False, num_workers=2)
+    dataloader = _build_sharded_dataloader(
+        dataset,
+        batch_size=batch_size,
+        num_workers=2,
+        is_done=lambda idx: (output_path / dataset.output_paths[idx]).is_file(),
+        overwrite=overwrite,
+    )
+    if dataloader is None:
+        return
 
-    # Process batches
-    total_batches = len(dataloader)
-    logger.info(f"Processing captions in {total_batches:,} batches...")
+    # Load text encoder and embeddings processor
+    with console.status("[bold]Loading Gemma text encoder...", spinner="dots"):
+        text_encoder = load_text_encoder(
+            text_encoder_path,
+            device=device,
+            dtype=torch.bfloat16,
+            load_in_8bit=load_in_8bit,
+        )
+        embeddings_processor = load_embeddings_processor(
+            embedding_weight_paths(model_path, text_encoder_path),
+            gemma_model_path=text_encoder_path,
+            device=device,
+            dtype=torch.bfloat16,
+        )
+
+    logger.info("Text encoder and embeddings processor loaded successfully")
+    logger.info(f"Processing captions in {len(dataloader):,} batches...")
 
     with Progress(
         SpinnerColumn(),
@@ -304,15 +328,17 @@ def compute_captions_embeddings(  # noqa: PLR0913
     ) as progress:
         task = progress.add_task("Processing captions", total=len(dataloader))
         for batch in dataloader:
-            # Encode prompts using _preprocess_text (returns embeddings before connector)
-            # This is what we want to save - the connector is applied during training
+            # Encode prompts using text_encoder.encode() + feature_extractor
+            # (returns video/audio features before connector).
+            # The connector is applied during training via embeddings_processor
             with torch.inference_mode():
-                # TODO(batch-tokenization): When tokenizer supports batching, encode all prompts at once:
-                #   prompt_embeds, prompt_attention_mask = text_encoder._preprocess_text(batch["prompt"]) # noqa: ERA001
+                # TODO(batch-tokenization): When tokenizer supports batching, encode all prompts at once.
                 # For now, process one at a time:
                 for i in range(len(batch["prompt"])):
-                    prompt_embeds, prompt_attention_mask = text_encoder._preprocess_text(
-                        batch["prompt"][i], padding_side="left"
+                    encoded = text_encoder.encode([batch["prompt"][i]])
+                    hidden_states, prompt_attention_mask = encoded[0]
+                    video_prompt_embeds, audio_prompt_embeds = embeddings_processor.feature_extractor(
+                        hidden_states, prompt_attention_mask, "left"
                     )
 
                     output_rel_path = Path(batch["output_path"][i])
@@ -322,16 +348,51 @@ def compute_captions_embeddings(  # noqa: PLR0913
                     output_dir_path.mkdir(parents=True, exist_ok=True)
 
                     embedding_data = {
-                        "prompt_embeds": prompt_embeds[0].cpu().contiguous(),
+                        "video_prompt_embeds": video_prompt_embeds[0].cpu().contiguous(),
                         "prompt_attention_mask": prompt_attention_mask[0].cpu().contiguous(),
                     }
+                    if audio_prompt_embeds is not None:
+                        embedding_data["audio_prompt_embeds"] = audio_prompt_embeds[0].cpu().contiguous()
 
                     output_file = output_path / output_rel_path
-                    torch.save(embedding_data, output_file)
+                    _atomic_save(embedding_data, output_file)
 
             progress.advance(task)
 
-    logger.info(f"Processed {len(dataset):,} captions. Embeddings saved to {output_path}")
+    logger.info(f"Processed {len(dataloader.dataset):,} captions -> {output_path}")  # type: ignore[arg-type]
+
+
+def _atomic_save(data: Any, out: Path) -> None:  # noqa: ANN401
+    """Save to ``out`` atomically via per-PID temp file + replace.
+    Crash mid-write leaves an orphan ``.tmp.<pid>`` file that the skip logic
+    ignores. The per-PID suffix makes concurrent writes from multiple ranks
+    collision-free.
+    """
+    tmp = out.with_suffix(f"{out.suffix}.tmp.{os.getpid()}")
+    torch.save(data, tmp)
+    tmp.replace(out)
+
+
+def _build_sharded_dataloader(
+    dataset: Dataset,
+    *,
+    batch_size: int,
+    num_workers: int,
+    is_done: Callable[[int], bool],
+    overwrite: bool,
+) -> DataLoader | None:
+    """Return a DataLoader over this rank's interleaved shard of ``dataset``.
+    When ``overwrite`` is False, items whose outputs already exist (per
+    ``is_done``) are filtered out. Returns ``None`` if this rank has nothing
+    to do, so the caller can early-return without loading any models.
+    """
+    state = PartialState()
+    todo = [i for i in range(state.process_index, len(dataset), state.num_processes) if overwrite or not is_done(i)]
+    if not todo:
+        logger.info(f"Rank {state.process_index}/{state.num_processes}: nothing to do")
+        return None
+    logger.info(f"Rank {state.process_index}/{state.num_processes}: processing {len(todo):,} of {len(dataset):,} items")
+    return DataLoader(Subset(dataset, todo), batch_size=batch_size, shuffle=False, num_workers=num_workers)
 
 
 @app.command()
@@ -381,24 +442,35 @@ def main(  # noqa: PLR0913
         default=False,
         help="Load the Gemma text encoder in 8-bit precision to save GPU memory (requires bitsandbytes)",
     ),
+    overwrite: bool = typer.Option(
+        default=False,
+        help="Re-encode every caption even if its output exists. Use when rerunning with "
+        "changed parameters (different text encoder, lora_trigger, etc.) so stale outputs are replaced.",
+    ),
 ) -> None:
     """Process text captions and save embeddings for video generation training.
+    For multi-GPU preprocessing, invoke under ``accelerate launch`` - each process
+    will handle an interleaved shard of the dataset.
     This script processes captions from metadata files and saves text embeddings
     that can be used for training video generation models. The output embeddings
     will maintain the same folder structure and naming as the corresponding media files.
-    Note: This script is designed for LTX-2 models which use the Gemma text encoder.
+    Note: This script supports the LTX family. Use the Gemma root that matches the
+    checkpoint; LTX 2.5 uses the LTX-specific fine-tuned Gemma 4 model, not Google's
+    vanilla Gemma 4 model.
     Examples:
-        # Process captions with LTX-2 model
+        # Process captions with an LTX checkpoint
         python scripts/process_captions.py dataset.json --output-dir ./embeddings \\
-            --model-path /path/to/ltx2_checkpoint.safetensors \\
-            --text-encoder-path /path/to/gemma
+            --model-path /path/to/ltx-checkpoint.safetensors \\
+            --text-encoder-path /path/to/gemma-root
         # Add a trigger word for LoRA training
         python scripts/process_captions.py dataset.json --output-dir ./embeddings \\
-            --model-path /path/to/ltx2.safetensors --text-encoder-path /path/to/gemma \\
+            --model-path /path/to/ltx-checkpoint.safetensors \\
+            --text-encoder-path /path/to/gemma-root \\
             --lora-trigger "mytoken"
         # Remove LLM-generated prefixes from captions
         python scripts/process_captions.py dataset.json --output-dir ./embeddings \\
-            --model-path /path/to/ltx2.safetensors --text-encoder-path /path/to/gemma \\
+            --model-path /path/to/ltx-checkpoint.safetensors \\
+            --text-encoder-path /path/to/gemma-root \\
             --remove-llm-prefixes
     """
 
@@ -422,6 +494,7 @@ def main(  # noqa: PLR0913
         batch_size=batch_size,
         device=device,
         load_in_8bit=load_text_encoder_in_8bit,
+        overwrite=overwrite,
     )
 
 

@@ -53,6 +53,8 @@ def main():
 
     model_path = config["model"]["model_path"]
     text_encoder_path = config["model"]["text_encoder_path"]
+    video_vae_path = config["model"].get("video_vae_path")
+    audio_vae_path = config["model"].get("audio_vae_path")
     preprocessed_root = config["data"]["preprocessed_data_root"]
     load_8bit = config.get("acceleration", {}).get("load_text_encoder_in_8bit", False)
     with_audio = config.get("training_strategy", {}).get("with_audio", False)
@@ -71,15 +73,20 @@ def main():
         "--text-encoder-path", text_encoder_path,
         "--output-dir", preprocessed_root,
     ]
+    if video_vae_path:
+        cmd.extend(["--video-vae-path", video_vae_path])
+    if audio_vae_path:
+        cmd.extend(["--audio-vae-path", audio_vae_path])
     if load_8bit:
         cmd.append("--load-text-encoder-in-8bit")
-    if with_audio:
-        cmd.append("--with-audio")
+    if not with_audio:
+        cmd.append("--skip-audio")
 
     print(f"Dataset:    {dataset_path}")
     print(f"Config:     {config_path}")
     print(f"Model:      {model_path}")
     print(f"Encoder:    {text_encoder_path}")
+    print(f"VAE:        {video_vae_path}")
     print(f"Output:     {preprocessed_root}")
     print(f"Resolution: {resolution}")
     sys.exit(subprocess.call(cmd))

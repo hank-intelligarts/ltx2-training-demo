@@ -24,6 +24,7 @@ class ContentMatching:
 
     prefix: str = ""
     suffix: str = ""
+    contains: str = ""
 
 
 class KeyValueOperationResult(NamedTuple):
@@ -64,6 +65,7 @@ class SDOps:
     mapping: tuple[
         ContentReplacement | ContentMatching | SDKeyValueOperation, ...
     ] = ()  # Immutable tuple of (key, value) pairs
+    allowed_keys: frozenset[str] | None = None
 
     def with_replacement(self, content: str, replacement: str) -> "SDOps":
         """Create a new SDOps instance with the specified replacement added to the mapping."""
@@ -71,11 +73,18 @@ class SDOps:
         new_mapping = (*self.mapping, ContentReplacement(content, replacement))
         return replace(self, mapping=new_mapping)
 
-    def with_matching(self, prefix: str = "", suffix: str = "") -> "SDOps":
-        """Create a new SDOps instance with the specified prefix and suffix matching added to the mapping."""
+    def with_matching(self, prefix: str = "", suffix: str = "", contains: str = "") -> "SDOps":
+        """Create a new SDOps instance with the specified prefix, suffix and contains matching added to the mapping."""
 
-        new_mapping = (*self.mapping, ContentMatching(prefix, suffix))
+        new_mapping = (*self.mapping, ContentMatching(prefix, suffix, contains))
         return replace(self, mapping=new_mapping)
+
+    def with_additional_allowed_keys(self, keys: frozenset[str]) -> "SDOps":
+        """Create a new SDOps instance that only passes keys present in *keys* (post-replacement).
+        If allowed_keys already exists, the sets are merged via union.
+        """
+        merged = frozenset(keys) | self.allowed_keys if self.allowed_keys is not None else frozenset(keys)
+        return replace(self, allowed_keys=merged)
 
     def with_kv_operation(
         self,
@@ -92,7 +101,12 @@ class SDOps:
     def apply_to_key(self, key: str) -> str | None:
         """Apply the mapping to the given name."""
         matchers = [content for content in self.mapping if isinstance(content, ContentMatching)]
-        valid = any(key.startswith(f.prefix) and key.endswith(f.suffix) for f in matchers)
+        valid = any(
+            key.startswith(matcher.prefix)
+            and key.endswith(matcher.suffix)
+            and (not matcher.contains or matcher.contains in key)
+            for matcher in matchers
+        )
         if not valid:
             return None
 
@@ -101,6 +115,10 @@ class SDOps:
                 continue
             if replacement.content in key:
                 key = key.replace(replacement.content, replacement.replacement)
+
+        if self.allowed_keys is not None and key not in self.allowed_keys:
+            return None
+
         return key
 
     def apply_to_key_value(self, key: str, value: torch.Tensor) -> list[KeyValueOperationResult]:
