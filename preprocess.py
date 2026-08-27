@@ -24,9 +24,11 @@ def install_packages():
              "--no-deps", str(PACKAGES / pkg)],
             stdout=subprocess.DEVNULL,
         )
-    # Ensure compatible bitsandbytes version
+    # Ensure compatible bitsandbytes version and pin transformers below 5.15
+    # (5.15+ has AmbiguousGlobalPerLayerAttributeError breaking Gemma4 init)
     subprocess.check_call(
-        [sys.executable, "-m", "pip", "install", "--upgrade", "bitsandbytes>=0.45.0"],
+        [sys.executable, "-m", "pip", "install", "--upgrade",
+         "bitsandbytes>=0.45.0", "transformers>=5.8.0,<5.15"],
         stdout=subprocess.DEVNULL,
     )
     print("Done.")
