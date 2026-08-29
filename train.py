@@ -5,9 +5,13 @@ LTX-2 LoRA Training Launcher
 先安裝 repo 內的 ltx-core / ltx-trainer，再用子程序跑 training script，
 確保 import 的一定是本 repo 的版本。
 """
+import os
 import subprocess
 import sys
 from pathlib import Path
+
+# Ensure triton cache is writable (Slurm jobs may lack $HOME write access)
+os.environ.setdefault("TRITON_CACHE_DIR", "/tmp/.triton")
 
 ROOT = Path(__file__).resolve().parent
 PACKAGES = ROOT / "packages"
@@ -47,7 +51,9 @@ def main():
     install_packages()
     print(f"Config:  {config_path}")
     print(f"Trainer: {TRAIN_SCRIPT}")
-    sys.exit(subprocess.call([sys.executable, str(TRAIN_SCRIPT), str(config_path)]))
+    env = os.environ.copy()
+    env.setdefault("TRITON_CACHE_DIR", "/tmp/.triton")
+    sys.exit(subprocess.call([sys.executable, str(TRAIN_SCRIPT), str(config_path)], env=env))
 
 
 if __name__ == "__main__":
