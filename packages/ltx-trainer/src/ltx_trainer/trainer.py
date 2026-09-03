@@ -372,9 +372,9 @@ class LtxvTrainer:
             video_features = conditions["video_prompt_embeds"]
             audio_features = conditions.get("audio_prompt_embeds")
         else:
-            # Legacy format: single prompt_embeds tensor — duplicate for both modalities
+            # Legacy format: single prompt_embeds tensor
             video_features = conditions["prompt_embeds"]
-            audio_features = conditions["prompt_embeds"]
+            audio_features = conditions["prompt_embeds"] if self._embeddings_processor.audio_connector is not None else None
 
         mask = conditions["prompt_attention_mask"]
         additive_mask = convert_to_additive_mask(mask, video_features.dtype)
@@ -432,6 +432,8 @@ class LtxvTrainer:
             dtype=torch.bfloat16,
         )
         self._embeddings_processor.feature_extractor = None
+        if not getattr(self._config.training_strategy, "with_audio", False):
+            self._embeddings_processor.audio_connector = None
 
         transformer_dtype = torch.bfloat16 if self._config.model.training_mode == "lora" else torch.float32
         self._transformer = self._transformer.to(dtype=transformer_dtype)
