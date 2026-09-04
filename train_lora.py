@@ -2,19 +2,23 @@
 LTX-2 v2.5 LoRA Training — One-Command Launcher
 =================================================
 
-Usage:
-    python train_lora.py /storage/Internal_NAS/<user>/my-dataset
+Usage (on Slurm Dashboard):
+    python train_lora.py <username> <dataset_name>
+    python train_lora.py <username> <dataset_name> --steps 2000 --rank 32
 
-The dataset folder must contain:
-    dataset.json   — [{"caption": "...", "media_path": "videos/xxx.mp4"}, ...]
-    videos/        — the video files referenced in dataset.json
+Dataset setup:
+    Put your dataset on NAS at:
+        /storage/Internal_NAS/slurm_workspace/<username>/datasets/<dataset_name>/
+            dataset.json
+            videos/
+                clip1.mp4
+                clip2.mp4
 
-Everything runs on local SSD for speed. Results stay on local SSD.
+    dataset.json format:
+        [{"caption": "A cat playing", "media_path": "videos/clip1.mp4"}, ...]
 
-Optional flags:
-    --steps N          Training steps (default: 1000)
-    --rank N           LoRA rank (default: 16)
-    --resolution WxHxF Video resolution (default: 512x320x25)
+All processing and output is written to local SSD for speed.
+Results stay on the node that ran the job — check the log for the path.
 """
 import argparse
 import json
@@ -32,10 +36,13 @@ PACKAGES = ROOT / "packages"
 PREPROCESS_SCRIPT = PACKAGES / "ltx-trainer" / "scripts" / "process_dataset.py"
 TRAIN_SCRIPT = PACKAGES / "ltx-trainer" / "scripts" / "train.py"
 
-# Local SSD scratch space — each node writes here
+# NAS paths (read-only)
+NAS_WORKSPACE = Path("/storage/Internal_NAS/slurm_workspace")
+
+# Local SSD scratch (per-node, writable)
 LOCAL_SCRATCH = Path("/storage/SSD2/training_scratch")
 
-# Checkpoints on NAS (read-only)
+# Model checkpoints on NAS (read-only)
 CHECKPOINTS = {
     "transformer": "/storage/Internal_NAS/Checkpoints/LTX-2_Release/v2.5/checkpoints/ltx-2.5-22b-dev-transformer-bf16.safetensors",
     "text_encoder": "/storage/Internal_NAS/Checkpoints/LTX-2_Release/v2.5/text_encoders/gemma4-12b-with-proj-ltx-2.5-bf16.safetensors",
@@ -44,7 +51,7 @@ CHECKPOINTS = {
 
 
 def install_packages():
-    print("[1/4] Installing packages...")
+    print("[1/3] Installing packages...")
     for pkg in ["ltx-core", "ltx-trainer"]:
         subprocess.check_call(
             [sys.executable, "-m", "pip", "install", "--force-reinstall",
@@ -64,8 +71,8 @@ def validate_dataset(dataset_dir: Path) -> list[dict]:
     if not dataset_json.exists():
         print(f"ERROR: {dataset_json} not found.")
         print()
-        print("Your dataset folder should look like:")
-        print("  my-dataset/")
+        print("Put your dataset at:")
+        print(f"  {dataset_dir}/")
         print("    dataset.json")
         print("    videos/")
         print("      clip1.mp4")
@@ -101,21 +108,15 @@ def validate_dataset(dataset_dir: Path) -> list[dict]:
     return data
 
 
-def setup_local_workspace(dataset_dir: Path) -> tuple[Path, Path]:
-    """Create local SSD workspaces and return (preprocess_dir, run_dir).
-
-    Preprocess is reusable across runs (keyed by dataset name).
-    Each training run gets its own timestamped folder.
+def setup_local_workspace(username: str, dataset_name: str) -> tuple[Path, Path]:
+    """Create local SSD workspace, return (preprocess_dir, run_dir).
 
     Layout:
-        /storage/SSD2/training_scratch/<dataset_name>/
-            precomputed/             — shared, reused across runs
+        /storage/SSD2/training_scratch/<username>/<dataset_name>/
+            precomputed/             — shared across runs
             runs/<YYYYMMDD_HHMMSS>/  — per-run output
-                config.yaml
-                checkpoints/
-                samples/
     """
-    base = LOCAL_SCRATCH / dataset_dir.name
+    base = LOCAL_SCRATCH / username / dataset_name
     preprocess_dir = base / "precomputed"
     preprocess_dir.mkdir(parents=True, exist_ok=True)
 
@@ -127,12 +128,11 @@ def setup_local_workspace(dataset_dir: Path) -> tuple[Path, Path]:
 
 
 def run_preprocess(dataset_dir: Path, preprocess_dir: Path, resolution: str):
-    # Check if already preprocessed (latents + conditions dirs with files)
     latents_dir = preprocess_dir / "latents" / "videos"
     conditions_dir = preprocess_dir / "conditions" / "videos"
     if (latents_dir.is_dir() and conditions_dir.is_dir()
             and any(latents_dir.iterdir()) and any(conditions_dir.iterdir())):
-        print("[2/3] Preprocessing already done, skipping.")
+        print("[2/3] Preprocessing already done on this node, skipping.")
         return
 
     print("[2/3] Preprocessing (video latents + text embeddings)...")
@@ -159,8 +159,6 @@ def run_preprocess(dataset_dir: Path, preprocess_dir: Path, resolution: str):
 
 def generate_config(preprocess_dir: Path, run_dir: Path, args) -> Path:
     w, h, f = [int(x) for x in args.resolution.split("x")]
-    precomputed = str(preprocess_dir)
-    output_dir = str(run_dir)
 
     config = f"""# Auto-generated LTX-2 v2.5 LoRA config
 model:
@@ -197,7 +195,7 @@ acceleration:
   load_text_encoder_in_8bit: true
 
 data:
-  preprocessed_data_root: "{precomputed}"
+  preprocessed_data_root: "{preprocess_dir}"
   num_dataloader_workers: 2
 
 validation:
@@ -232,7 +230,7 @@ wandb:
   tags: ["ltx2", "lora"]
 
 seed: 42
-output_dir: "{output_dir}"
+output_dir: "{run_dir}"
 """
     config_path = run_dir / "config.yaml"
     config_path.write_text(config)
@@ -254,50 +252,52 @@ def main():
     parser = argparse.ArgumentParser(
         description="LTX-2 v2.5 LoRA Training — one command",
         formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=__doc__,
     )
-    parser.add_argument("dataset", help="Dataset folder on NAS (must contain dataset.json + videos/)")
+    parser.add_argument("username", help="Your username (matches your folder on NAS)")
+    parser.add_argument("dataset", help="Dataset name (folder name under your datasets/)")
     parser.add_argument("--steps", type=int, default=1000, help="Training steps (default: 1000)")
     parser.add_argument("--rank", type=int, default=16, help="LoRA rank (default: 16)")
     parser.add_argument("--resolution", default="512x320x25", help="WxHxF (default: 512x320x25)")
     args = parser.parse_args()
 
-    dataset_dir = Path(args.dataset).resolve()
-    if not dataset_dir.is_dir():
-        print(f"ERROR: {dataset_dir} is not a directory.")
-        sys.exit(1)
-
+    # Resolve paths
+    dataset_dir = NAS_WORKSPACE / args.username / "datasets" / args.dataset
     hostname = socket.gethostname()
+
     print("=" * 60)
     print("  LTX-2 v2.5 LoRA Training")
-    print(f"  Node: {hostname}")
+    print(f"  User: {args.username}  Dataset: {args.dataset}  Node: {hostname}")
     print("=" * 60)
 
-    # Validate dataset on NAS
+    # Validate
+    if not dataset_dir.is_dir():
+        print(f"ERROR: Dataset not found at {dataset_dir}")
+        print()
+        print("To set up your dataset:")
+        print(f"  1. Create folder: {dataset_dir}/")
+        print(f"  2. Put dataset.json and videos/ inside")
+        sys.exit(1)
+
     validate_dataset(dataset_dir)
 
-    # Check checkpoints on NAS
     for name, path in CHECKPOINTS.items():
         if not Path(path).exists():
             print(f"ERROR: Checkpoint not found: {path}")
             sys.exit(1)
 
-    # Setup local workspace on SSD
-    preprocess_dir, run_dir = setup_local_workspace(dataset_dir)
-    print(f"    Preprocess cache: {preprocess_dir}")
-    print(f"    Training output:  {run_dir}")
+    # Setup local workspace
+    preprocess_dir, run_dir = setup_local_workspace(args.username, args.dataset)
+    print(f"    Local workspace: {run_dir}")
 
-    # Install packages
+    # Install, preprocess, train
     install_packages()
 
-    # Preprocess (reads NAS, writes local SSD)
     w, h, f = [int(x) for x in args.resolution.split("x")]
     run_preprocess(dataset_dir, preprocess_dir, f"{w}x{h}x{f}")
 
-    # Generate config (all paths point to local SSD)
     config_path = generate_config(preprocess_dir, run_dir, args)
-    print(f"    Config: {config_path}")
 
-    # Train (all on local SSD)
     run_training(config_path)
 
     print()
