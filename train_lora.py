@@ -9,7 +9,7 @@ The dataset folder must contain:
     dataset.json   — [{"caption": "...", "media_path": "videos/xxx.mp4"}, ...]
     videos/        — the video files referenced in dataset.json
 
-Everything runs on local SSD for speed. Results are copied back to NAS when done.
+Everything runs on local SSD for speed. Results stay on local SSD.
 
 Optional flags:
     --steps N          Training steps (default: 1000)
@@ -19,10 +19,10 @@ Optional flags:
 import argparse
 import json
 import os
-import shutil
 import socket
 import subprocess
 import sys
+from datetime import datetime
 from pathlib import Path
 
 os.environ.setdefault("TRITON_CACHE_DIR", "/tmp/.triton")
@@ -101,36 +101,43 @@ def validate_dataset(dataset_dir: Path) -> list[dict]:
     return data
 
 
-def setup_local_workspace(dataset_dir: Path) -> Path:
-    """Create a local SSD workspace and return its path.
+def setup_local_workspace(dataset_dir: Path) -> tuple[Path, Path]:
+    """Create local SSD workspaces and return (preprocess_dir, run_dir).
 
-    Layout on local SSD:
+    Preprocess is reusable across runs (keyed by dataset name).
+    Each training run gets its own timestamped folder.
+
+    Layout:
         /storage/SSD2/training_scratch/<dataset_name>/
-            precomputed/     — preprocessing output
-            output/          — training output (checkpoints, samples)
-            config.yaml      — generated config
+            precomputed/             — shared, reused across runs
+            runs/<YYYYMMDD_HHMMSS>/  — per-run output
+                config.yaml
+                checkpoints/
+                samples/
     """
-    workspace = LOCAL_SCRATCH / dataset_dir.name
-    workspace.mkdir(parents=True, exist_ok=True)
-    (workspace / "precomputed").mkdir(exist_ok=True)
-    (workspace / "output").mkdir(exist_ok=True)
-    return workspace
+    base = LOCAL_SCRATCH / dataset_dir.name
+    preprocess_dir = base / "precomputed"
+    preprocess_dir.mkdir(parents=True, exist_ok=True)
+
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    run_dir = base / "runs" / timestamp
+    run_dir.mkdir(parents=True, exist_ok=True)
+
+    return preprocess_dir, run_dir
 
 
-def run_preprocess(dataset_dir: Path, workspace: Path, resolution: str):
-    precomputed = workspace / "precomputed"
-
+def run_preprocess(dataset_dir: Path, preprocess_dir: Path, resolution: str):
     # Check if already preprocessed (latents + conditions dirs with files)
-    latents_dir = precomputed / "latents" / "videos"
-    conditions_dir = precomputed / "conditions" / "videos"
+    latents_dir = preprocess_dir / "latents" / "videos"
+    conditions_dir = preprocess_dir / "conditions" / "videos"
     if (latents_dir.is_dir() and conditions_dir.is_dir()
             and any(latents_dir.iterdir()) and any(conditions_dir.iterdir())):
-        print("[2/4] Preprocessing already done, skipping.")
+        print("[2/3] Preprocessing already done, skipping.")
         return
 
-    print("[2/4] Preprocessing (video latents + text embeddings)...")
+    print("[2/3] Preprocessing (video latents + text embeddings)...")
     print(f"    Reading from NAS:  {dataset_dir}")
-    print(f"    Writing to local:  {precomputed}")
+    print(f"    Writing to local:  {preprocess_dir}")
 
     cmd = [
         sys.executable, str(PREPROCESS_SCRIPT),
@@ -139,7 +146,7 @@ def run_preprocess(dataset_dir: Path, workspace: Path, resolution: str):
         "--model-path", CHECKPOINTS["transformer"],
         "--text-encoder-path", CHECKPOINTS["text_encoder"],
         "--video-vae-path", CHECKPOINTS["video_vae"],
-        "--output-dir", str(precomputed),
+        "--output-dir", str(preprocess_dir),
         "--load-text-encoder-in-8bit",
         "--skip-audio",
     ]
@@ -150,10 +157,10 @@ def run_preprocess(dataset_dir: Path, workspace: Path, resolution: str):
     print("    Done.")
 
 
-def generate_config(workspace: Path, args) -> Path:
+def generate_config(preprocess_dir: Path, run_dir: Path, args) -> Path:
     w, h, f = [int(x) for x in args.resolution.split("x")]
-    precomputed = str(workspace / "precomputed")
-    output_dir = str(workspace / "output")
+    precomputed = str(preprocess_dir)
+    output_dir = str(run_dir)
 
     config = f"""# Auto-generated LTX-2 v2.5 LoRA config
 model:
@@ -227,13 +234,13 @@ wandb:
 seed: 42
 output_dir: "{output_dir}"
 """
-    config_path = workspace / "config.yaml"
+    config_path = run_dir / "config.yaml"
     config_path.write_text(config)
     return config_path
 
 
 def run_training(config_path: Path):
-    print("[3/4] Training...")
+    print("[3/3] Training...")
     env = os.environ.copy()
     env.setdefault("TRITON_CACHE_DIR", "/tmp/.triton")
     ret = subprocess.call([sys.executable, str(TRAIN_SCRIPT), str(config_path)], env=env)
@@ -241,20 +248,6 @@ def run_training(config_path: Path):
         print("ERROR: Training failed.")
         sys.exit(ret)
     print("    Done.")
-
-
-def copy_results_to_nas(dataset_dir: Path, workspace: Path):
-    """Copy training results back to NAS next to the dataset folder."""
-    print("[4/4] Copying results back to NAS...")
-    nas_output = dataset_dir.parent / f"{dataset_dir.name}_lora_output"
-    local_output = workspace / "output"
-
-    if nas_output.exists():
-        shutil.rmtree(nas_output)
-    shutil.copytree(local_output, nas_output)
-
-    print(f"    Results saved to: {nas_output}")
-    return nas_output
 
 
 def main():
@@ -289,31 +282,30 @@ def main():
             sys.exit(1)
 
     # Setup local workspace on SSD
-    workspace = setup_local_workspace(dataset_dir)
-    print(f"    Local workspace: {workspace}")
+    preprocess_dir, run_dir = setup_local_workspace(dataset_dir)
+    print(f"    Preprocess cache: {preprocess_dir}")
+    print(f"    Training output:  {run_dir}")
 
     # Install packages
     install_packages()
 
     # Preprocess (reads NAS, writes local SSD)
     w, h, f = [int(x) for x in args.resolution.split("x")]
-    run_preprocess(dataset_dir, workspace, f"{w}x{h}x{f}")
+    run_preprocess(dataset_dir, preprocess_dir, f"{w}x{h}x{f}")
 
     # Generate config (all paths point to local SSD)
-    config_path = generate_config(workspace, args)
+    config_path = generate_config(preprocess_dir, run_dir, args)
     print(f"    Config: {config_path}")
 
     # Train (all on local SSD)
     run_training(config_path)
 
-    # Copy results back to NAS
-    nas_output = copy_results_to_nas(dataset_dir, workspace)
-
     print()
     print("=" * 60)
     print("  DONE!")
-    print(f"  LoRA weights: {nas_output}/checkpoints/")
-    print(f"  Validation:   {nas_output}/samples/")
+    print(f"  Node:         {hostname}")
+    print(f"  LoRA weights: {run_dir}/checkpoints/")
+    print(f"  Validation:   {run_dir}/samples/")
     print("=" * 60)
 
 
