@@ -370,7 +370,7 @@ class LtxvTrainer:
         if "video_prompt_embeds" in conditions:
             # New format: separate video/audio features from precompute()
             video_features = conditions["video_prompt_embeds"]
-            audio_features = conditions.get("audio_prompt_embeds")
+            audio_features = conditions.get("audio_prompt_embeds") if self._embeddings_processor.audio_connector is not None else None
         else:
             # Legacy format: single prompt_embeds tensor
             video_features = conditions["prompt_embeds"]
